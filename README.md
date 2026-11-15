@@ -1,11 +1,11 @@
 # Wargames
 
-Round-based tactical wargame: **buy like Counter-Strike, plan like classic Rainbow Six, then manage it live.**
+Single-player, round-based tactical wargame (skirmish vs an AI opponent): **buy like Counter-Strike, plan like classic Rainbow Six, then manage it live.**
 
 Each round:
 
-1. **Plan (60s).** Spend money on units and defenses. Tap a unit, then tap the map to lay waypoints. Tap a waypoint to tag it with a **go code**: ALPHA → BRAVO → CHARLIE → off. A tagged waypoint is a breakpoint, and the unit holds there.
-2. **Execute (live).** Both plans run at the same time. Call **A / B / C** to release everyone holding on that code at once. That's how you sync a tank push over the bridge with infantry wading the ford. Tap a single unit's card to release just that unit. A code called early stays open, so units arriving later walk straight through.
+1. **Plan (untimed; hit READY when you're set).** Spend money on units and defenses. Tap a unit, then tap the map to lay waypoints. Tap a waypoint to tag it with a **go code**: ALPHA → BRAVO → CHARLIE → off. A tagged waypoint is a breakpoint, and the unit holds there.
+2. **Execute (live).** Your plan and the AI's run at the same time. Call **A / B / C** to release everyone holding on that code at once. That's how you sync a tank push over the bridge with infantry wading the ford. Tap a single unit's card to release just that unit. A code called early stays open, so units arriving later walk straight through.
 3. **Audible.** **⟲ RECALL** sends a unit back to its spawn. It stays home for the rest of the round and still defends. If everyone on both sides ends up home, the round is a draw.
 
 **Win a round** by eliminating the enemy team, or by destroying their base. The base can only be damaged when no enemy unit or turret is inside its guard ring.

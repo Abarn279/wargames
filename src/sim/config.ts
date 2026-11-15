@@ -144,7 +144,6 @@ export const DEFENSES: Record<DefenseType, DefenseStats> = {
 
 export const RULES = {
   tickRate: 20,
-  planSeconds: 60,
   roundSeconds: 120,
   roundsToWin: 5,
   maxRounds: 12,

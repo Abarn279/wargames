@@ -71,7 +71,6 @@ export class Game {
   private units: PlanUnit[] = [];
   private defenses: DefensePlan[] = [];
   private money = 0;
-  private planEnds = 0;
   private placing: ShopItem | null = null;
   private selected: Selection | null = null;
   private lastWaypoints = new Map<string, Waypoint[]>();
@@ -171,7 +170,6 @@ export class Game {
     this.defenses = [];
     this.placing = null;
     this.selected = null;
-    this.planEnds = this.now + RULES.planSeconds * 1000;
     const ai = planAi(this.map, ENEMY, this.match, this.seed + this.match.round * 7919);
     this.aiPlan = ai.plan;
     this.match.teams[ENEMY].money -= ai.spent;
@@ -214,7 +212,6 @@ export class Game {
     this.lastFrame = t;
     this.now = t;
 
-    if (this.phase === 'plan' && this.now >= this.planEnds) this.ready();
     if (this.phase === 'live' && this.sim) {
       this.acc += dt;
       while (this.acc >= TICK && !this.sim.result) {
@@ -1255,20 +1252,20 @@ export class Game {
     const [s0, s1] = [this.match.teams[0].score, this.match.teams[1].score];
     text(ctx, `ROUND ${this.match.round - (this.phase === 'roundEnd' || this.phase === 'matchEnd' ? 1 : 0)}`, 12, h / 2, fs, C.dim, 'left', 800);
     const cx = this.W / 2;
-    text(ctx, 'BLUE', cx - 34, h / 2, fs, C.team[0], 'right', 800);
+    text(ctx, 'YOU', cx - 34, h / 2, fs, C.team[0], 'right', 800);
     text(ctx, `${s0} – ${s1}`, cx, h / 2, fs * 1.25, C.text, 'center', 800);
-    text(ctx, 'RED', cx + 34, h / 2, fs, C.team[1], 'left', 800);
+    text(ctx, 'AI', cx + 34, h / 2, fs, C.team[1], 'left', 800);
     text(ctx, `first to ${RULES.roundsToWin}`, cx + 34 + fs * 3, h / 2, fs * 0.75, C.dim, 'left', 600);
 
     if (this.phase === 'plan') {
-      const left = Math.max(0, (this.planEnds - this.now) / 1000);
+      // Untimed: the round starts when you say so.
       const bw = 92;
+      const canGo = this.units.length > 0;
       this.button({ x: this.W - bw - 8, y: 5, w: bw, h: h - 10 }, 'READY ▶', () => {
-        if (!this.units.length) this.flash('No units: you will lose by elimination!', C.danger);
+        if (!this.units.length) { this.flash('Buy at least one unit first', C.danger); return; }
         this.ready();
-      }, { color: C.ok, size: fs });
-      text(ctx, fmtTime(left), this.W - bw - 20, h / 2, fs * 1.1, left < 10 ? C.danger : C.text, 'right', 800);
-      text(ctx, `$${this.money}`, this.W - bw - 80, h / 2, fs * 1.1, C.ok, 'right', 800);
+      }, { color: canGo ? C.ok : C.dim, size: fs });
+      text(ctx, `$${this.money}`, this.W - bw - 20, h / 2, fs * 1.1, C.ok, 'right', 800);
       text(ctx, 'PLAN', 12 + fs * 6, h / 2, fs, C.hold, 'left', 800);
     } else if (this.sim) {
       text(ctx, fmtTime(this.sim.timeLeft), this.W - 12, h / 2, fs * 1.1, this.sim.timeLeft < 15 ? C.danger : C.text, 'right', 800);
@@ -1341,7 +1338,7 @@ export class Game {
   private drawTitle() {
     const ctx = this.ctx;
     const rules = [
-      ['1', 'Each round: 60s to buy units and defenses and route every unit.'],
+      ['1', 'Each round: buy units and defenses, route every unit. Take your time.'],
       ['2', 'Tap a waypoint to tag it ALPHA, BRAVO or CHARLIE. Units hold there.'],
       ['3', 'Live: call a go code to release everyone holding on it, together.'],
       ['4', 'Tanks crush infantry. Rocketeers kill tanks. Rifles kill rocketeers.'],
@@ -1355,7 +1352,7 @@ export class Game {
     let y = Math.max(8, (this.H - total) / 2) + big / 2;
     text(ctx, 'WARGAMES', this.W / 2, y, big, C.text, 'center', 900);
     y += big * 0.5 + fs * 1.1;
-    text(ctx, 'Buy. Plan. Execute. Adapt.', this.W / 2, y, fs * 1.1, C.hold, 'center', 700);
+    text(ctx, 'Skirmish vs AI  ·  Buy. Plan. Execute. Adapt.', this.W / 2, y, fs * 1.1, C.hold, 'center', 700);
     y += fs * 2.1;
     ctx.font = `500 ${fs}px system-ui`;
     const widest = Math.max(...rules.map(([, s]) => ctx.measureText(s).width));
