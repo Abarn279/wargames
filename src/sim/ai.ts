@@ -1,36 +1,28 @@
-import { RULES, UNITS, DEFENSES, other, type Team, type UnitType, type DefenseType } from './config';
+import { RULES, UNITS, DEFENSES, GO_CODES, other, type Team, type UnitType, type DefenseType, type GoCode } from './config';
 import { type GameMap, type Pt, canDeployUnit, canFortify, key, mirrorTile, nearestWalkable } from './map';
 import { findPath, type Waypoint } from './path';
 import { Rng } from './rng';
 import { ownBlocked, type Command, type DefensePlan, type Sim, type TeamPlan, type UnitPlan } from './sim';
 import type { Match } from './match';
 
-// All AI positions are authored from the west (team 0) side and mirrored for team 1.
-const LANES: Pt[][] = [
-  [{ x: 12, y: 1 }, { x: 23, y: 1 }, { x: 31, y: 5 }, { x: 33, y: 9 }],
-  [{ x: 13, y: 10 }, { x: 22, y: 10 }, { x: 33, y: 10 }],
-  [{ x: 12, y: 18 }, { x: 23, y: 18 }, { x: 31, y: 14 }, { x: 33, y: 10 }],
-];
-const HOLD_INDEX = 1; // breakpoint at the far side of midfield
-const GUARD_SPOTS: Pt[] = [{ x: 5, y: 9 }, { x: 5, y: 11 }, { x: 4, y: 7 }, { x: 4, y: 12 }];
-const TURRET_SPOTS: Pt[] = [{ x: 4, y: 9 }, { x: 4, y: 11 }, { x: 3, y: 7 }, { x: 3, y: 12 }];
-const BARRICADE_SPOTS: Pt[] = [{ x: 6, y: 6 }, { x: 6, y: 13 }, { x: 9, y: 9 }, { x: 9, y: 10 }, { x: 7, y: 6 }, { x: 7, y: 13 }];
-const MINE_SPOTS: Pt[] = [{ x: 11, y: 2 }, { x: 11, y: 17 }, { x: 13, y: 9 }, { x: 8, y: 4 }, { x: 8, y: 15 }, { x: 14, y: 11 }];
-
 const side = (m: GameMap, team: Team, p: Pt) => (team === 0 ? p : mirrorTile(m, p));
 
 export interface AiPlanResult { plan: TeamPlan; spent: number }
 
-/** Build the AI's purchases, defenses and unit plans for a round. */
+/** Build the AI's purchases, defenses and unit plans for a round. Reacts to what the enemy fielded last round. */
 export function planAi(m: GameMap, team: Team, match: Match, seed: number): AiPlanResult {
   const rng = new Rng(seed);
   const econ = match.teams[team];
   let money = econ.money;
   const units: UnitPlan[] = econ.roster.map((u) => ({ ...u, waypoints: [] }));
+  const intel = match.lastFielded[other(team)];
+  const count = (types: UnitType[], t: UnitType) => types.filter((x) => x === t).length;
+  const enemyTanks = count(intel, 'tank');
+  const enemyAT = count(intel, 'rocketeer');
 
   // --- Defenses first so unit paths route around them ---
   const defenses: DefensePlan[] = [];
-  const defBudget = Math.floor(money * (money > 2000 ? 0.25 : 0.1));
+  const defBudget = Math.floor(money * (money > 2200 ? 0.22 : 0.08));
   let defSpent = 0;
   const buyDef = (type: DefenseType, spots: Pt[]) => {
     const cost = DEFENSES[type].cost;
@@ -44,72 +36,100 @@ export function planAi(m: GameMap, team: Team, match: Match, seed: number): AiPl
     defSpent += cost;
     return true;
   };
-  if (defBudget >= DEFENSES.turret.cost && rng.next() < 0.7) buyDef('turret', TURRET_SPOTS);
+  if (enemyTanks) { buyDef('tanktrap', m.ai.tanktrap); buyDef('mine', m.ai.mine); }
+  else if (defBudget >= DEFENSES.turret.cost && rng.next() < 0.6) buyDef('turret', m.ai.turret);
   for (let i = 0; i < 6; i++) {
     const roll = rng.next();
-    if (!buyDef(roll < 0.5 ? 'mine' : 'barricade', roll < 0.5 ? MINE_SPOTS : BARRICADE_SPOTS)) break;
+    const [type, spots]: [DefenseType, Pt[]] = roll < 0.45 ? ['mine', m.ai.mine] : roll < 0.8 ? ['barricade', m.ai.barricade] : ['tanktrap', m.ai.tanktrap];
+    if (!buyDef(type, spots)) break;
   }
   money -= defSpent;
 
   // --- Units ---
-  const weights: [UnitType, number][] = [['rifleman', 4], ['gunner', 2], ['breacher', 3], ['sniper', 1.5]];
+  const buy = (t: UnitType) => {
+    const owned = units.filter((u) => u.type === t).length;
+    if (UNITS[t].cost > money || units.length >= RULES.maxUnits || owned >= (UNITS[t].maxPerTeam ?? 99)) return false;
+    units.push({ id: match.newUnitId(team), type: t, spawn: { x: -1, y: -1 }, waypoints: [] });
+    money -= UNITS[t].cost;
+    return true;
+  };
+  const tankOdds = enemyAT >= 2 ? 0.2 : intel.length && !enemyAT ? 0.7 : 0.45;
+  if (money >= UNITS.tank.cost + 400 && rng.next() < tankOdds) buy('tank');
+  for (let i = 0; i < Math.min(2, enemyTanks * 2); i++) buy('rocketeer');
+  const weights: [UnitType, number][] = [['rifleman', 4], ['gunner', 2], ['breacher', 2], ['sniper', 1.2], ['medic', 1], ['rocketeer', 0.6]];
   const roll = (): UnitType => {
     const total = weights.reduce((a, [, w]) => a + w, 0);
     let r = rng.next() * total;
     for (const [t, w] of weights) if ((r -= w) <= 0) return t;
     return 'rifleman';
   };
-  const target = Math.min(RULES.maxUnits, 5);
-  let guard = 0;
-  while (units.length < target && guard++ < 40) {
-    let t = roll();
-    if (UNITS[t].cost > money) t = 'rifleman';
-    if (UNITS[t].cost > money) break;
-    units.push({ id: match.newUnitId(team), type: t, spawn: { x: 0, y: 0 }, waypoints: [] });
-    money -= UNITS[t].cost;
+  for (let guard = 0; units.length < 5 && guard < 40; guard++) {
+    if (!buy(roll()) && !buy('rifleman')) break;
   }
 
-  // --- Spawns ---
-  const blocked = ownBlocked(defenses);
+  // --- Spawns (closest free tile to base that the unit's movement class can use) ---
   const taken = new Set<number>();
   const zone = m.deploy[team];
-  const spawnTiles: Pt[] = [];
-  for (let y = 0; y < m.h; y++)
-    for (let x = zone.x0; x <= zone.x1; x++)
-      if (canDeployUnit(m, team, x, y) && !blocked.has(key(x, y))) spawnTiles.push({ x, y });
   const base = m.bases[team];
-  spawnTiles.sort((a, b) => Math.hypot(a.x - base.x, a.y - base.y) - Math.hypot(b.x - base.x, b.y - base.y));
   for (const u of units) {
-    const ok = (p: Pt) => !taken.has(key(p.x, p.y)) && spawnTiles.some((s) => s.x === p.x && s.y === p.y);
-    if (!ok(u.spawn)) u.spawn = spawnTiles.find(ok) ?? spawnTiles[0];
+    const cls = UNITS[u.type].move;
+    const blocked = ownBlocked(defenses, cls);
+    const ok = (p: Pt) => canDeployUnit(m, team, p.x, p.y, cls) && !blocked.has(key(p.x, p.y)) && !taken.has(key(p.x, p.y)) && !defenses.some((d) => d.x === p.x && d.y === p.y);
+    if (!ok(u.spawn)) {
+      const tiles: Pt[] = [];
+      for (let y = 0; y < m.h; y++) for (let x = zone.x0; x <= zone.x1; x++) if (ok({ x, y })) tiles.push({ x, y });
+      tiles.sort((a, b) => Math.hypot(a.x - base.x, a.y - base.y) - Math.hypot(b.x - base.x, b.y - base.y));
+      u.spawn = tiles[0] ?? u.spawn;
+    }
     taken.add(key(u.spawn.x, u.spawn.y));
   }
 
   // --- Roles & routes ---
-  const order = [...units].sort((a, b) => (a.type === 'gunner' ? -1 : 0) - (b.type === 'gunner' ? -1 : 0));
-  const guards = units.length >= 3 ? 1 : 0;
-  const lanePicks = [rng.int(0, 2)];
-  if (rng.next() < 0.6) lanePicks.push((lanePicks[0] + rng.int(1, 2)) % 3);
-  order.forEach((u, i) => {
-    if (i < guards) {
-      const g = nearestWalkable(m, side(m, team, rng.pick(GUARD_SPOTS)), blocked);
-      u.waypoints = [{ ...g, hold: false }];
-      return;
-    }
-    const lane = LANES[lanePicks[i % lanePicks.length]];
-    const holds = rng.next() < 0.65;
-    const wps: Waypoint[] = lane.map((p, j) => ({ ...nearestWalkable(m, side(m, team, p), blocked), hold: holds && j === HOLD_INDEX }));
-    // Drop legs that are unreachable from the spawn (defensive; the map is fully connected).
-    u.waypoints = wps.filter((w) => findPath(m, u.spawn, w, blocked) !== null || (w.x === u.spawn.x && w.y === u.spawn.y));
-  });
+  const vehicleLanes = m.ai.lanes.map((l, i) => (l.vehicle ? i : -1)).filter((i) => i >= 0);
+  const hasTank = units.some((u) => u.type === 'tank');
+  const laneA = hasTank ? rng.pick(vehicleLanes) : rng.int(0, m.ai.lanes.length - 1);
+  const laneB = (laneA + rng.int(1, m.ai.lanes.length - 1)) % m.ai.lanes.length;
+  const groups: { lane: number; code: GoCode }[] = [{ lane: laneA, code: 'A' }];
+  if (rng.next() < 0.6) groups.push({ lane: laneB, code: 'B' });
+  const holds = rng.next() < 0.8;
 
+  const order = [...units].sort((a, b) => roleRank(a.type) - roleRank(b.type));
+  let guards = units.length >= 3 ? 1 : 0;
+  let garrisons = m.ai.garrison.length && units.length >= 4 && rng.next() < 0.65 ? 1 : 0;
+  let gi = 0;
+  for (const u of order) {
+    const cls = UNITS[u.type].move;
+    const blocked = ownBlocked(defenses, cls);
+    const reach = (w: Pt) => findPath(m, u.spawn, w, blocked, cls) !== null;
+    if (cls === 'foot' && guards > 0 && (u.type === 'gunner' || u.type === 'rifleman' || u.type === 'medic')) {
+      guards--;
+      u.waypoints = [{ ...nearestWalkable(m, side(m, team, rng.pick(m.ai.guard)), blocked), code: null }];
+      continue;
+    }
+    if (cls === 'foot' && garrisons > 0 && (u.type === 'sniper' || u.type === 'rocketeer' || u.type === 'gunner')) {
+      garrisons--;
+      const spot = nearestWalkable(m, side(m, team, rng.pick(m.ai.garrison)), blocked);
+      if (reach(spot)) { u.waypoints = [{ ...spot, code: null }]; continue; }
+    }
+    const g = cls === 'vehicle' ? groups[0] : groups[gi++ % groups.length];
+    const lane = m.ai.lanes[cls === 'vehicle' && !m.ai.lanes[g.lane].vehicle ? rng.pick(vehicleLanes) : g.lane];
+    const wps: Waypoint[] = lane.pts.map((p, j) => ({
+      ...nearestWalkable(m, side(m, team, p), blocked, cls),
+      code: holds && j === lane.hold ? g.code : null,
+    }));
+    u.waypoints = wps.filter(reach);
+  }
   return { plan: { units, defenses }, spent: econ.money - money };
 }
 
-/** Live AI: releases breakpoints with some timing sense and recalls when the base is threatened. */
+function roleRank(t: UnitType) {
+  return { gunner: 0, sniper: 1, rocketeer: 2, medic: 3, rifleman: 4, breacher: 5, tank: 6 }[t];
+}
+
+/** Live AI: calls go codes once its groups are set, and recalls when the base is threatened. */
 export class AiDirector {
-  private holdSince = new Map<string, number>();
-  private patience = new Map<string, number>();
+  private firstHold = new Map<GoCode, number>();
+  private patience = new Map<GoCode, number>();
   private lastRecall = -999;
   private rng: Rng;
   constructor(readonly team: Team, seed: number) {
@@ -122,18 +142,18 @@ export class AiDirector {
     const mine = sim.alive(this.team);
     const tr = RULES.tickRate;
 
-    // Coordinated release: a held unit goes once its patience runs out,
-    // or immediately when every other advancing teammate is also holding.
-    const advancing = mine.filter((u) => u.state === 'moving' || u.state === 'holding');
-    const allHolding = advancing.length > 0 && advancing.every((u) => u.state === 'holding');
-    for (const u of mine) {
-      if (u.state !== 'holding') { this.holdSince.delete(u.id); continue; }
-      if (!this.holdSince.has(u.id)) {
-        this.holdSince.set(u.id, sim.tick);
-        this.patience.set(u.id, tr * (2 + this.rng.next() * 5));
+    for (const code of GO_CODES) {
+      if (sim.fired[this.team].has(code)) continue;
+      // Members: units holding on this code, or still en route to a breakpoint with it.
+      const members = mine.filter((u) => u.holdCode === code || (u.state === 'moving' && u.path.slice(u.pi).some((n) => n.bp === code)));
+      const holding = members.filter((u) => u.state === 'holding');
+      if (!holding.length) continue;
+      if (!this.firstHold.has(code)) {
+        this.firstHold.set(code, sim.tick);
+        this.patience.set(code, tr * (5 + this.rng.next() * 6));
       }
-      const waited = sim.tick - this.holdSince.get(u.id)!;
-      if ((allHolding && waited > tr) || waited >= this.patience.get(u.id)!) cmds.push({ team: this.team, unitId: u.id, kind: 'go' });
+      const waited = sim.tick - this.firstHold.get(code)!;
+      if ((holding.length === members.length && waited > tr) || waited >= this.patience.get(code)!) cmds.push({ team: this.team, kind: 'code', code });
     }
 
     // Emergency audible: enemy spotted near our base and nobody guarding it.
@@ -144,7 +164,7 @@ export class AiDirector {
       const candidates = mine.filter((u) => u.state === 'moving' || u.state === 'holding' || u.state === 'done');
       candidates.sort((a, b) => Math.hypot(a.x - base.x, a.y - base.y) - Math.hypot(b.x - base.x, b.y - base.y));
       if (candidates.length > 1) { // never pull the last attacker
-        cmds.push({ team: this.team, unitId: candidates[0].id, kind: 'recall' });
+        cmds.push({ team: this.team, kind: 'recall', unitId: candidates[0].id });
         this.lastRecall = sim.tick;
       }
     }

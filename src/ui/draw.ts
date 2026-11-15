@@ -53,3 +53,17 @@ export const fmtTime = (s: number) => {
   const t = Math.ceil(s);
   return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
 };
+
+/** Draw text shrunk (down to `min` px) or ellipsized so it fits `maxW`. */
+export function fitText(
+  ctx: CanvasRenderingContext2D, s: string, x: number, y: number, maxW: number,
+  size: number, color: string = C.text, align: CanvasTextAlign = 'left', weight = 600, min = 9,
+) {
+  let fs = size;
+  const font = (f: number) => `${weight} ${f}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+  ctx.font = font(fs);
+  while (fs > min && ctx.measureText(s).width > maxW) ctx.font = font(--fs);
+  let out = s;
+  while (out.length > 1 && ctx.measureText(out).width > maxW) out = out.slice(0, -2) + '…';
+  text(ctx, out, x, y, fs, color, align, weight);
+}

@@ -23,6 +23,8 @@ export class Match {
     return { money: RULES.startMoney, score: 0, lossStreak: 0, roster: [] };
   }
   history: RoundSummary[] = [];
+  /** What each team fielded last round: the other side saw it in combat, so the AI may react to it. */
+  lastFielded: [UnitType[], UnitType[]] = [[], []];
   /** undefined while in progress; Team for a winner; null for a drawn match. */
   winner: Team | null | undefined = undefined;
   private idCounter: [number, number] = [0, 0];
@@ -54,6 +56,7 @@ export class Match {
       e.roster = r.survivors[t];
       earned[t] = gain;
     }
+    this.lastFielded = r.fielded;
     const summary = { round: this.round, result: r, earned };
     this.history.push(summary);
     const [s0, s1] = [this.teams[0].score, this.teams[1].score];

@@ -1,11 +1,11 @@
-import { DEFENSES, RULES, UNITS, type DefenseType, type Team, type UnitType } from '../sim/config';
-import { MAPS, canDeployUnit, canFortify, key, nearestWalkable, tileAt, type Pt } from '../sim/map';
+import { CODE_NAMES, DEFENSES, GO_CODES, RULES, UNITS, type DamageType, type DefenseType, type GoCode, type Team, type UnitType } from '../sim/config';
+import { MAPS, MAP_ORDER, canDeployUnit, canFortify, key, nearestWalkable, tileAt, type Pt } from '../sim/map';
 import { expandPlan, findPath, type PathNode, type Waypoint } from '../sim/path';
 import { hasLos } from '../sim/los';
 import { Sim, ownBlocked, type Command, type DefensePlan, type TeamPlan, type Unit } from '../sim/sim';
 import { Match, type RoundSummary } from '../sim/match';
 import { AiDirector, planAi } from '../sim/ai';
-import { C, bar, fmtTime, inRect, roundRect, text, type Rect } from './draw';
+import { C, bar, fitText, fmtTime, inRect, roundRect, text, type Rect } from './draw';
 
 type Phase = 'title' | 'plan' | 'live' | 'roundEnd' | 'matchEnd';
 type ShopItem = { kind: 'unit'; type: UnitType } | { kind: 'def'; type: DefenseType };
@@ -15,20 +15,26 @@ interface PlanUnit { id: string; type: UnitType; spawn: Pt; waypoints: Waypoint[
 interface Hit extends Rect { fn: () => void }
 
 type Effect =
-  | { kind: 'tracer'; team: Team; fx: number; fy: number; tx: number; ty: number; t0: number; heavy: boolean; hit: boolean }
-  | { kind: 'boom'; x: number; y: number; t0: number }
-  | { kind: 'corpse'; team: Team; x: number; y: number; t0: number }
+  | { kind: 'tracer'; team: Team; fx: number; fy: number; tx: number; ty: number; t0: number; dtype: DamageType; hit: boolean }
+  | { kind: 'boom'; x: number; y: number; r: number; t0: number }
+  | { kind: 'corpse'; team: Team; x: number; y: number; t0: number; tank: boolean }
   | { kind: 'wreck'; x: number; y: number; t0: number };
 
-const SHOP: ShopItem[] = [
-  { kind: 'unit', type: 'rifleman' },
-  { kind: 'unit', type: 'gunner' },
-  { kind: 'unit', type: 'sniper' },
-  { kind: 'unit', type: 'breacher' },
-  { kind: 'def', type: 'barricade' },
-  { kind: 'def', type: 'turret' },
-  { kind: 'def', type: 'mine' },
-];
+const SHOP_UNITS: ShopItem[] = (['rifleman', 'gunner', 'sniper', 'rocketeer', 'breacher', 'medic', 'tank'] as UnitType[]).map((type) => ({ kind: 'unit', type }));
+const SHOP_DEFS: ShopItem[] = (['barricade', 'tanktrap', 'turret', 'mine'] as DefenseType[]).map((type) => ({ kind: 'def', type }));
+const TRACERS: Record<DamageType, { life: number; width: number; color?: string }> = {
+  bullet: { life: 110, width: 1.2 },
+  precision: { life: 260, width: 1.6, color: '#ffffff' },
+  rocket: { life: 260, width: 3, color: '#ff9a3c' },
+  he: { life: 180, width: 3.2, color: '#ffe08a' },
+  demo: { life: 120, width: 2.2 },
+  blast: { life: 0, width: 0 },
+};
+const withAlpha = (hex: string, a: number) => {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`;
+};
+export const CODE_COLORS: Record<GoCode, string> = { A: '#ffd23f', B: '#3fd8ff', C: '#ff6bd5' };
 const PLAYER: Team = 0;
 const ENEMY: Team = 1;
 const TICK = 1000 / RULES.tickRate;
@@ -41,7 +47,9 @@ export class Game {
   private W = 0;
   private H = 0;
   private dpr = 1;
-  private map = MAPS.crossroads;
+  private mapId = MAP_ORDER[0];
+  private map = MAPS[MAP_ORDER[0]];
+  private shopTab: 'unit' | 'def' = 'unit';
   private match = new Match();
   private phase: Phase = 'title';
   private now = 0;
@@ -79,6 +87,7 @@ export class Game {
   private visible = new Set<string>();
   private seenDefs = new Set<string>();
   private fog = new Uint8Array(0);
+  private hulls = new Map<string, number>();
   private effects: Effect[] = [];
   private summary: RoundSummary | null = null;
   private resultAt = 0;
@@ -147,6 +156,8 @@ export class Game {
   // ======================= Phase transitions =======================
 
   private startMatch() {
+    this.map = MAPS[this.mapId];
+    this.resize();
     this.match = new Match();
     this.lastWaypoints.clear();
     this.startPlanning();
@@ -186,7 +197,7 @@ export class Game {
     this.summary = null;
     this.phase = 'live';
     this.refreshVision();
-    this.flash('Breakpoints flash yellow — tap the unit card to send them.', C.hold);
+    this.flash('Units stop at breakpoints. Call the go code (or tap a card) to send them.', C.hold);
   }
 
   private endRound() {
@@ -245,12 +256,14 @@ export class Game {
       if (e.kind === 'shot') {
         const mine = e.team === PLAYER;
         const shooterSeen = mine || this.visible.has(e.shooter) || this.fogAt(e.fx, e.fy);
-        if (shooterSeen || this.fogAt(e.tx, e.ty)) this.effects.push({ kind: 'tracer', team: e.team, fx: e.fx, fy: e.fy, tx: e.tx, ty: e.ty, t0: this.now, heavy: e.heavy, hit: e.hit });
+        if (shooterSeen || this.fogAt(e.tx, e.ty)) this.effects.push({ kind: 'tracer', team: e.team, fx: e.fx, fy: e.fy, tx: e.tx, ty: e.ty, t0: this.now, dtype: e.dtype, hit: e.hit });
       } else if (e.kind === 'boom') {
-        this.effects.push({ kind: 'boom', x: e.x, y: e.y, t0: this.now });
-        if (navigator.vibrate) navigator.vibrate(30);
+        if (e.team === PLAYER || this.fogAt(e.x, e.y)) this.effects.push({ kind: 'boom', x: e.x, y: e.y, r: e.r, t0: this.now });
+        if (e.r > 1.2 && navigator.vibrate) navigator.vibrate(30);
+      } else if (e.kind === 'code') {
+        if (e.team === PLAYER) this.flash(`${CODE_NAMES[e.code]} — go, go, go`, CODE_COLORS[e.code]);
       } else if (e.kind === 'death') {
-        if (e.team === PLAYER || this.fogAt(e.x, e.y)) this.effects.push({ kind: 'corpse', team: e.team, x: e.x, y: e.y, t0: this.now });
+        if (e.team === PLAYER || this.fogAt(e.x, e.y)) this.effects.push({ kind: 'corpse', team: e.team, x: e.x, y: e.y, t0: this.now, tank: sim.units.find((u) => u.id === e.id)?.type === 'tank' });
         if (e.team === PLAYER) this.flash(`Unit down`, C.danger);
       } else if (e.kind === 'wreck') {
         this.effects.push({ kind: 'wreck', x: e.x, y: e.y, t0: this.now });
@@ -294,17 +307,18 @@ export class Game {
     this.toast = { msg, until: this.now + 2600, color };
   }
 
-  private blockedForPlayer() { return ownBlocked(this.defenses); }
+  private blockedForPlayer(type: UnitType = 'rifleman') { return ownBlocked(this.defenses, UNITS[type].move); }
+  private cls(type: UnitType) { return UNITS[type].move; }
 
   private occupied(x: number, y: number) {
     return this.units.some((u) => u.spawn.x === x && u.spawn.y === y) || this.defenses.some((d) => d.x === x && d.y === y);
   }
 
   private pathFor(u: PlanUnit): PathNode[] {
-    const k = `${u.spawn.x},${u.spawn.y}|${u.waypoints.map((w) => `${w.x},${w.y},${+w.hold}`).join(';')}|${this.defenses.map((d) => `${d.type}${d.x},${d.y}`).join(';')}`;
+    const k = `${u.type}|${u.spawn.x},${u.spawn.y}|${u.waypoints.map((w) => `${w.x},${w.y},${w.code}`).join(';')}|${this.defenses.map((d) => `${d.type}${d.x},${d.y}`).join(';')}`;
     let p = this.pathCache.get(k);
     if (!p) {
-      p = expandPlan(this.map, u.spawn, u.waypoints, this.blockedForPlayer());
+      p = expandPlan(this.map, u.spawn, u.waypoints, this.blockedForPlayer(u.type), this.cls(u.type));
       if (this.pathCache.size > 400) this.pathCache.clear();
       this.pathCache.set(k, p);
     }
@@ -315,6 +329,8 @@ export class Game {
     if (itemCost(i) > this.money) return 'Not enough money';
     if (i.kind === 'unit' && this.units.length >= RULES.maxUnits) return `Max ${RULES.maxUnits} units`;
     if (i.kind === 'def' && this.defenses.length >= RULES.maxDefenses) return `Max ${RULES.maxDefenses} defenses`;
+    const cap = i.kind === 'unit' ? UNITS[i.type].maxPerTeam : undefined;
+    if (cap !== undefined && this.units.filter((u) => u.type === i.type).length >= cap) return `Max ${cap} ${UNITS[i.type as UnitType].name.toLowerCase()}s`;
     return null;
   }
 
@@ -324,7 +340,12 @@ export class Game {
     const same = this.placing && this.placing.kind === i.kind && this.placing.type === i.type;
     this.placing = same ? null : i;
     this.selected = null;
-    if (this.placing) this.flash(i.kind === 'unit' ? 'Tap inside your deploy zone (shaded) to place.' : 'Tap inside your half to place. Tap again to place more.');
+    if (this.placing) {
+      if (i.kind === 'unit') {
+        const st = UNITS[i.type];
+        this.flash(`${st.name}: strong vs ${st.strong.toLowerCase()}, weak vs ${st.weak.toLowerCase()}. Tap the shaded zone.`, C.text);
+      } else this.flash(`${DEFENSES[i.type].blurb} Tap inside your half to place.`);
+    }
   }
 
   private placeAt(t: Pt) {
@@ -333,13 +354,16 @@ export class Game {
     if (why) { this.flash(why, C.danger); this.placing = null; return; }
     if (this.occupied(t.x, t.y)) { this.flash('Tile occupied', C.danger); return; }
     if (i.kind === 'unit') {
-      if (!canDeployUnit(this.map, PLAYER, t.x, t.y) || this.blockedForPlayer().has(key(t.x, t.y))) { this.flash('Units deploy in the shaded zone', C.danger); return; }
+      if (!canDeployUnit(this.map, PLAYER, t.x, t.y, this.cls(i.type)) || this.blockedForPlayer(i.type).has(key(t.x, t.y))) {
+        this.flash(this.cls(i.type) === 'vehicle' ? 'Tanks deploy on open ground in the shaded zone' : 'Units deploy in the shaded zone', C.danger);
+        return;
+      }
       const id = this.match.newUnitId(PLAYER);
       this.units.push({ id, type: i.type, spawn: t, waypoints: [], veteran: false });
       this.money -= itemCost(i);
       this.placing = null;
       this.selected = { kind: 'unit', id };
-      this.flash('Tap the map to add waypoints. Tap a waypoint to make it a breakpoint.');
+      this.flash('Tap the map to add waypoints. Tap a waypoint to set its go code (A → B → C → off).');
     } else {
       if (!canFortify(this.map, PLAYER, t.x, t.y)) { this.flash('Defenses go on open ground in your half', C.danger); return; }
       this.defenses.push({ type: i.type, x: t.x, y: t.y });
@@ -359,29 +383,33 @@ export class Game {
     if (this.placing) { this.placeAt(t); return; }
 
     const sel = this.selUnit();
-    // Tap an existing waypoint of the selected unit -> toggle breakpoint
+    // Tap an existing waypoint of the selected unit -> cycle its go code
     if (sel) {
       const wi = sel.waypoints.findIndex((w) => w.x === t.x && w.y === t.y);
-      if (wi >= 0) {
-        sel.waypoints[wi].hold = !sel.waypoints[wi].hold;
-        this.flash(sel.waypoints[wi].hold ? 'Breakpoint set: unit will wait here for your GO.' : 'Breakpoint removed', C.hold);
-        return;
-      }
+      if (wi >= 0) { this.cycleCode(sel.waypoints[wi]); return; }
     }
     const unitHere = this.units.find((u) => u.spawn.x === t.x && u.spawn.y === t.y);
     if (unitHere && unitHere !== sel) { this.selected = { kind: 'unit', id: unitHere.id }; return; }
     const di = this.defenses.findIndex((d) => d.x === t.x && d.y === t.y);
     if (di >= 0 && !sel) { this.selected = { kind: 'def', index: di }; return; }
     if (sel) {
-      const blocked = this.blockedForPlayer();
-      const target = nearestWalkable(this.map, { x: t.x + 0.5, y: t.y + 0.5 }, blocked);
+      const cls = this.cls(sel.type);
+      const blocked = this.blockedForPlayer(sel.type);
+      const target = nearestWalkable(this.map, { x: t.x + 0.5, y: t.y + 0.5 }, blocked, cls);
       const from = sel.waypoints.length ? sel.waypoints[sel.waypoints.length - 1] : sel.spawn;
       if (from.x === target.x && from.y === target.y) return;
-      if (!findPath(this.map, from, target, blocked)) { this.flash('No route there', C.danger); return; }
-      sel.waypoints.push({ ...target, hold: false });
+      if (!findPath(this.map, from, target, blocked, cls)) { this.flash('No route there', C.danger); return; }
+      if (cls === 'vehicle' && (target.x !== t.x || target.y !== t.y)) this.flash('Tanks can’t enter buildings, forest or water — snapped to open ground', C.dim);
+      sel.waypoints.push({ ...target, code: null });
       return;
     }
     this.selected = null;
+  }
+
+  private cycleCode(w: Waypoint) {
+    const order: (GoCode | null)[] = [null, ...GO_CODES];
+    w.code = order[(order.indexOf(w.code) + 1) % order.length];
+    this.flash(w.code ? `Breakpoint ${CODE_NAMES[w.code]}: waits here until you call ${CODE_NAMES[w.code]}` : 'Breakpoint removed', w.code ? CODE_COLORS[w.code] : C.dim);
   }
 
   private sellSelected() {
@@ -406,6 +434,11 @@ export class Game {
   private command(u: Unit, kind: 'go' | 'recall') {
     this.pending.push({ team: PLAYER, unitId: u.id, kind });
     if (navigator.vibrate) navigator.vibrate(kind === 'go' ? 15 : [20, 40, 20]);
+  }
+
+  private callCode(code: GoCode) {
+    this.pending.push({ team: PLAYER, kind: 'code', code });
+    if (navigator.vibrate) navigator.vibrate(25);
   }
 
   private liveTap(px: number, py: number) {
@@ -457,7 +490,7 @@ export class Game {
       const t = this.dragTile;
       this.dragTile = null;
       const u = this.units.find((v) => v.id === d.dragUnit);
-      if (u && t && canDeployUnit(this.map, PLAYER, t.x, t.y) && !this.occupied(t.x, t.y) && !this.blockedForPlayer().has(key(t.x, t.y))) {
+      if (u && t && canDeployUnit(this.map, PLAYER, t.x, t.y, this.cls(u.type)) && !this.occupied(t.x, t.y) && !this.blockedForPlayer(u.type).has(key(t.x, t.y))) {
         u.spawn = t;
         this.selected = { kind: 'unit', id: u.id };
       } else if (u && t && !(t.x === u.spawn.x && t.y === u.spawn.y)) this.flash('Units start in the deploy zone', C.danger);
@@ -471,7 +504,6 @@ export class Game {
     for (let i = this.hits.length - 1; i >= 0; i--) {
       if (inRect(this.hits[i], x, y)) { this.hits[i].fn(); return; }
     }
-    if (this.phase === 'title') { this.startMatch(); return; }
     if (this.phase === 'plan') this.planTap(x, y);
     else if (this.phase === 'live') this.liveTap(x, y);
     else if (this.phase === 'roundEnd' && this.now - this.resultAt > 600) {
@@ -494,51 +526,115 @@ export class Game {
 
   // ======================= Drawing: map =======================
 
+  private mapLayer: HTMLCanvasElement | null = null;
+  private mapLayerKey = '';
+
+  /** The terrain never changes during a match, so it is painted once into an offscreen layer per size. */
   private drawMap() {
-    const ctx = this.ctx, m = this.map, ts = this.ts;
+    const m = this.map, ts = this.ts;
+    const k = `${m.id}|${ts}|${this.dpr}`;
+    if (k !== this.mapLayerKey || !this.mapLayer) {
+      const c = this.mapLayer ?? document.createElement('canvas');
+      c.width = Math.ceil(m.w * ts * this.dpr);
+      c.height = Math.ceil(m.h * ts * this.dpr);
+      const lctx = c.getContext('2d')!;
+      lctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+      this.paintTerrain(lctx);
+      this.mapLayer = c;
+      this.mapLayerKey = k;
+    }
+    this.ctx.drawImage(this.mapLayer, this.ox, this.oy, m.w * ts, m.h * ts);
+  }
+
+  private paintTerrain(ctx: CanvasRenderingContext2D) {
+    const m = this.map, ts = this.ts;
+    const at = (x: number, y: number) => tileAt(m, x, y);
+    const dots = (X: number, Y: number, col: string, pts: number[][], size = 0.08) => {
+      ctx.fillStyle = col;
+      for (const [a, b] of pts) ctx.fillRect(X + a * ts, Y + b * ts, Math.max(1, ts * size), Math.max(1, ts * size));
+    };
+    // pass 1: ground
     for (let y = 0; y < m.h; y++)
       for (let x = 0; x < m.w; x++) {
-        const t = tileAt(m, x, y);
-        const X = this.sx(x), Y = this.sy(y);
-        if (t === 'wall') {
-          ctx.fillStyle = C.wall;
-          ctx.fillRect(X, Y, ts + 0.5, ts + 0.5);
-          if (tileAt(m, x, y + 1) !== 'wall') { ctx.fillStyle = C.wallTop; ctx.fillRect(X, Y + ts * 0.78, ts + 0.5, ts * 0.22); }
-        } else {
-          ctx.fillStyle = t === 'rough' ? C.rough : (x + y) % 2 ? C.floor : C.floorAlt;
-          ctx.fillRect(X, Y, ts + 0.5, ts + 0.5);
-          if (t === 'rough') {
-            ctx.fillStyle = C.roughDot;
-            for (const [a, b] of [[0.25, 0.3], [0.7, 0.2], [0.5, 0.65], [0.2, 0.8], [0.8, 0.75]]) ctx.fillRect(X + a * ts, Y + b * ts, Math.max(1, ts * 0.08), Math.max(1, ts * 0.08));
+        const t = at(x, y), X = x * ts, Y = y * ts;
+        const base = (x + y) % 2 ? C.floor : C.floorAlt;
+        const fill: Partial<Record<string, string>> = {
+          rough: C.rough, road: '#2b2d2c', water: '#0e2633', ford: '#1a3a42', forest: '#13241a',
+          interior: (x + y) % 2 ? '#2b241d' : '#2e2720', door: '#2b241d', wall: C.wall, window: C.wall,
+        };
+        ctx.fillStyle = fill[t] ?? base;
+        ctx.fillRect(X, Y, ts + 0.5, ts + 0.5);
+        if (t === 'rough') dots(X, Y, C.roughDot, [[0.25, 0.3], [0.7, 0.2], [0.5, 0.65], [0.2, 0.8], [0.8, 0.75]]);
+        if (t === 'road') {
+          ctx.fillStyle = 'rgba(255,255,255,0.05)';
+          const horiz = at(x - 1, y) === 'road' || at(x + 1, y) === 'road';
+          if (horiz) ctx.fillRect(X, Y + ts * 0.47, ts * 0.5, ts * 0.06); else ctx.fillRect(X + ts * 0.47, Y, ts * 0.06, ts * 0.5);
+        }
+        if (t === 'water') {
+          ctx.strokeStyle = 'rgba(120,190,230,0.18)';
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          for (const yy of [0.3, 0.7]) {
+            ctx.moveTo(X + ts * 0.1, Y + ts * yy);
+            ctx.quadraticCurveTo(X + ts * 0.3, Y + ts * (yy - 0.1), X + ts * 0.5, Y + ts * yy);
+            ctx.quadraticCurveTo(X + ts * 0.7, Y + ts * (yy + 0.1), X + ts * 0.9, Y + ts * yy);
           }
-          if (t === 'crate') {
-            const p = ts * 0.12;
-            ctx.fillStyle = C.crate;
-            ctx.fillRect(X + p, Y + p, ts - 2 * p, ts - 2 * p);
-            ctx.strokeStyle = C.crateEdge;
-            ctx.lineWidth = Math.max(1, ts * 0.06);
-            ctx.strokeRect(X + p, Y + p, ts - 2 * p, ts - 2 * p);
-            ctx.beginPath();
-            ctx.moveTo(X + p, Y + p); ctx.lineTo(X + ts - p, Y + ts - p);
-            ctx.moveTo(X + ts - p, Y + p); ctx.lineTo(X + p, Y + ts - p);
-            ctx.stroke();
+          ctx.stroke();
+        }
+        if (t === 'ford') dots(X, Y, 'rgba(150,200,210,0.25)', [[0.2, 0.25], [0.6, 0.4], [0.35, 0.7], [0.75, 0.8]], 0.1);
+        if (t === 'interior' || t === 'door') {
+          ctx.fillStyle = 'rgba(0,0,0,0.18)';
+          ctx.fillRect(X, Y + ts * 0.32, ts, 1);
+          ctx.fillRect(X, Y + ts * 0.66, ts, 1);
+        }
+        if (t === 'wall' && at(x, y + 1) !== 'wall' && at(x, y + 1) !== 'window') { ctx.fillStyle = C.wallTop; ctx.fillRect(X, Y + ts * 0.78, ts + 0.5, ts * 0.22); }
+        if (t === 'window') {
+          const vert = at(x, y - 1) === 'wall' || at(x, y - 1) === 'window' || at(x, y + 1) === 'wall' || at(x, y + 1) === 'window';
+          ctx.fillStyle = '#7fc4e8';
+          if (vert) ctx.fillRect(X + ts * 0.38, Y + ts * 0.12, ts * 0.24, ts * 0.76);
+          else ctx.fillRect(X + ts * 0.12, Y + ts * 0.38, ts * 0.76, ts * 0.24);
+        }
+        if (t === 'door') {
+          ctx.strokeStyle = '#a0763f';
+          ctx.lineWidth = Math.max(1.5, ts * 0.1);
+          ctx.strokeRect(X + ts * 0.15, Y + ts * 0.15, ts * 0.7, ts * 0.7);
+        }
+        if (t === 'crate') {
+          const p = ts * 0.12;
+          ctx.fillStyle = C.crate;
+          ctx.fillRect(X + p, Y + p, ts - 2 * p, ts - 2 * p);
+          ctx.strokeStyle = C.crateEdge;
+          ctx.lineWidth = Math.max(1, ts * 0.06);
+          ctx.strokeRect(X + p, Y + p, ts - 2 * p, ts - 2 * p);
+          ctx.beginPath();
+          ctx.moveTo(X + p, Y + p); ctx.lineTo(X + ts - p, Y + ts - p);
+          ctx.moveTo(X + ts - p, Y + p); ctx.lineTo(X + p, Y + ts - p);
+          ctx.stroke();
+        }
+        if (t === 'sandbag') {
+          ctx.fillStyle = '#857552';
+          for (const [a, b] of [[0.1, 0.18], [0.5, 0.18], [0.3, 0.45], [0.1, 0.72], [0.5, 0.72]]) {
+            ctx.beginPath(); ctx.roundRect(X + a * ts, Y + b * ts, ts * 0.4, ts * 0.24, ts * 0.1); ctx.fill();
           }
         }
       }
-    // subtle grid
+    // pass 2: tree canopies overlap neighbouring tiles, so draw them on top
+    for (let y = 0; y < m.h; y++)
+      for (let x = 0; x < m.w; x++) {
+        if (at(x, y) !== 'forest') continue;
+        const X = x * ts, Y = y * ts;
+        for (const [a, b, r, c] of [[0.3, 0.32, 0.3, '#1d3b27'], [0.72, 0.45, 0.28, '#224530'], [0.42, 0.75, 0.3, '#1a3524']] as [number, number, number, string][]) {
+          ctx.fillStyle = c;
+          ctx.beginPath(); ctx.arc(X + a * ts, Y + b * ts, r * ts, 0, Math.PI * 2); ctx.fill();
+        }
+      }
+    // grid + midline
     ctx.strokeStyle = C.grid;
     ctx.lineWidth = 1;
     ctx.beginPath();
-    for (let x = 0; x <= m.w; x++) { ctx.moveTo(this.sx(x), this.sy(0)); ctx.lineTo(this.sx(x), this.sy(m.h)); }
-    for (let y = 0; y <= m.h; y++) { ctx.moveTo(this.sx(0), this.sy(y)); ctx.lineTo(this.sx(m.w), this.sy(y)); }
+    for (let x = 0; x <= m.w; x++) { ctx.moveTo(x * ts, 0); ctx.lineTo(x * ts, m.h * ts); }
+    for (let y = 0; y <= m.h; y++) { ctx.moveTo(0, y * ts); ctx.lineTo(m.w * ts, y * ts); }
     ctx.stroke();
-    // midline
-    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
-    ctx.setLineDash([ts * 0.3, ts * 0.3]);
-    ctx.beginPath();
-    ctx.moveTo(this.sx(m.w / 2), this.sy(1)); ctx.lineTo(this.sx(m.w / 2), this.sy(m.h - 1));
-    ctx.stroke();
-    ctx.setLineDash([]);
   }
 
   private drawBase(team: Team, hp: number, defended: boolean | null) {
@@ -590,6 +686,20 @@ export class Game {
       ctx.lineWidth = ts * 0.14;
       for (let i = -1; i < 3; i++) { ctx.beginPath(); ctx.moveTo(X + i * ts * 0.45, Y + ts); ctx.lineTo(X + i * ts * 0.45 + ts, Y); ctx.stroke(); }
       ctx.restore();
+    } else if (d.type === 'tanktrap') {
+      // Czech hedgehog
+      ctx.strokeStyle = '#9aa3a8';
+      ctx.lineWidth = Math.max(2, ts * 0.13);
+      ctx.lineCap = 'round';
+      const r = ts * 0.32;
+      ctx.beginPath();
+      ctx.moveTo(cx - r, cy - r); ctx.lineTo(cx + r, cy + r);
+      ctx.moveTo(cx + r, cy - r); ctx.lineTo(cx - r, cy + r);
+      ctx.moveTo(cx, cy - r * 1.1); ctx.lineTo(cx, cy + r * 1.1);
+      ctx.stroke();
+      ctx.lineCap = 'butt';
+      ctx.fillStyle = col;
+      ctx.beginPath(); ctx.arc(cx, cy, ts * 0.09, 0, Math.PI * 2); ctx.fill();
     } else if (d.type === 'turret') {
       ctx.fillStyle = '#20282e';
       ctx.beginPath(); ctx.arc(cx, cy, ts * 0.42, 0, Math.PI * 2); ctx.fill();
@@ -608,10 +718,42 @@ export class Game {
     ctx.globalAlpha = 1;
   }
 
-  private drawUnitGlyph(x: number, y: number, team: Team, type: UnitType, num: number, facing: number, opts: { hpFrac?: number; ring?: string; alpha?: number; selected?: boolean } = {}) {
+  private drawTank(X: number, Y: number, team: Team, facing: number, hull: number) {
     const ctx = this.ctx, ts = this.ts;
-    const X = this.sx(x), Y = this.sy(y), r = ts * 0.36;
+    ctx.save();
+    ctx.translate(X, Y);
+    ctx.rotate(hull);
+    const L = ts * 0.92, Wd = ts * 0.66;
+    ctx.fillStyle = '#11171b';
+    ctx.fillRect(-L / 2, -Wd / 2, L, ts * 0.16);
+    ctx.fillRect(-L / 2, Wd / 2 - ts * 0.16, L, ts * 0.16);
+    ctx.fillStyle = C.team[team];
+    ctx.beginPath(); ctx.roundRect(-L * 0.44, -Wd * 0.36, L * 0.88, Wd * 0.72, ts * 0.08); ctx.fill();
+    ctx.restore();
+    ctx.save();
+    ctx.translate(X, Y);
+    ctx.rotate(facing);
+    ctx.fillStyle = '#0b0f12';
+    ctx.fillRect(0, -ts * 0.06, ts * 0.62, ts * 0.12);
+    ctx.beginPath(); ctx.arc(0, 0, ts * 0.21, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = C.team[team]; ctx.lineWidth = Math.max(1.5, ts * 0.06); ctx.stroke();
+    ctx.restore();
+  }
+
+  private drawUnitGlyph(x: number, y: number, team: Team, type: UnitType, num: number, facing: number,
+    opts: { hpFrac?: number; ring?: string; alpha?: number; selected?: boolean; suppressed?: boolean; hull?: number; code?: GoCode | null } = {}) {
+    const ctx = this.ctx, ts = this.ts;
+    const X = this.sx(x), Y = this.sy(y), tank = type === 'tank';
+    const r = ts * (tank ? 0.46 : 0.36);
     ctx.globalAlpha = opts.alpha ?? 1;
+    if (tank) {
+      if (opts.selected) { ctx.beginPath(); ctx.arc(X, Y, r + ts * 0.18, 0, Math.PI * 2); ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke(); }
+      if (opts.ring) { ctx.beginPath(); ctx.arc(X, Y, r + ts * 0.08, 0, Math.PI * 2); ctx.strokeStyle = opts.ring; ctx.lineWidth = Math.max(2, ts * 0.1); ctx.stroke(); }
+      this.drawTank(X, Y, team, facing, opts.hull ?? facing);
+      this.unitBadges(X, Y, r, team, num, opts);
+      ctx.globalAlpha = 1;
+      return;
+    }
     if (opts.selected) {
       ctx.beginPath(); ctx.arc(X, Y, r + ts * 0.2, 0, Math.PI * 2);
       ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
@@ -630,19 +772,47 @@ export class Game {
     ctx.beginPath(); ctx.arc(X, Y, r, 0, Math.PI * 2); ctx.fill();
     ctx.fillStyle = '#0b0f12';
     ctx.beginPath(); ctx.arc(X, Y, r * 0.72, 0, Math.PI * 2); ctx.fill();
-    text(ctx, UNITS[type].short, X, Y + 1, Math.max(8, r * 1.05), C.team[team], 'center', 800);
+    if (type === 'medic') {
+      ctx.fillStyle = C.team[team];
+      ctx.fillRect(X - r * 0.12, Y - r * 0.45, r * 0.24, r * 0.9);
+      ctx.fillRect(X - r * 0.45, Y - r * 0.12, r * 0.9, r * 0.24);
+    } else text(ctx, UNITS[type].short, X, Y + 1, Math.max(8, r * 1.05), C.team[team], 'center', 800);
+    this.unitBadges(X, Y, r, team, num, opts);
+    ctx.globalAlpha = 1;
+  }
+
+  private unitBadges(X: number, Y: number, r: number, team: Team, num: number, opts: { hpFrac?: number; suppressed?: boolean; code?: GoCode | null }) {
+    const ctx = this.ctx, ts = this.ts;
     if (team === PLAYER && num > 0) {
       const bx = X + r * 0.85, by = Y - r * 0.85;
       ctx.fillStyle = C.team[team];
       ctx.beginPath(); ctx.arc(bx, by, Math.max(5, r * 0.5), 0, Math.PI * 2); ctx.fill();
       text(ctx, String(num), bx, by + 0.5, Math.max(7, r * 0.62), '#0b0f12', 'center', 800);
     }
+    if (opts.code) {
+      const bx = X - r * 0.9, by = Y - r * 0.9;
+      ctx.fillStyle = CODE_COLORS[opts.code];
+      ctx.beginPath(); ctx.arc(bx, by, Math.max(5, r * 0.5), 0, Math.PI * 2); ctx.fill();
+      text(ctx, opts.code, bx, by + 0.5, Math.max(7, r * 0.62), '#0b0f12', 'center', 900);
+    }
+    if (opts.suppressed) {
+      // pinned-down marker: little chevrons over the head
+      ctx.strokeStyle = '#ffffff';
+      ctx.globalAlpha *= 0.85;
+      ctx.lineWidth = Math.max(1, ts * 0.06);
+      ctx.beginPath();
+      for (const dx of [-0.25, 0.25]) {
+        ctx.moveTo(X + (dx - 0.12) * ts, Y - r - ts * 0.28);
+        ctx.lineTo(X + dx * ts, Y - r - ts * 0.16);
+        ctx.lineTo(X + (dx + 0.12) * ts, Y - r - ts * 0.28);
+      }
+      ctx.stroke();
+    }
     if (opts.hpFrac !== undefined && opts.hpFrac < 1)
       bar(ctx, { x: X - r, y: Y + r + ts * 0.12, w: r * 2, h: Math.max(2, ts * 0.09) }, opts.hpFrac, opts.hpFrac > 0.35 ? C.ok : C.danger);
-    ctx.globalAlpha = 1;
   }
 
-  private drawPath(start: Pt, nodes: PathNode[], waypoints: Waypoint[] | null, color: string, emphasis: boolean) {
+  private drawPath(start: Pt, nodes: PathNode[], waypoints: Waypoint[] | null, color: string, emphasis: boolean, fired?: Set<GoCode>) {
     const ctx = this.ctx, ts = this.ts;
     if (!nodes.length) return;
     ctx.strokeStyle = color;
@@ -656,11 +826,11 @@ export class Game {
     ctx.setLineDash([]);
     ctx.globalAlpha = 1;
     // breakpoints along the path
-    for (const n of nodes) if (n.bp) this.drawBreakpoint(n.x + 0.5, n.y + 0.5, emphasis);
+    for (const n of nodes) if (n.bp) this.drawBreakpoint(n.x + 0.5, n.y + 0.5, n.bp, emphasis, fired?.has(n.bp));
     if (waypoints && emphasis) {
       waypoints.forEach((w, i) => {
         const X = this.sx(w.x + 0.5), Y = this.sy(w.y + 0.5);
-        if (!w.hold) {
+        if (!w.code) {
           ctx.fillStyle = color;
           ctx.beginPath(); ctx.arc(X, Y, ts * 0.22, 0, Math.PI * 2); ctx.fill();
           text(ctx, String(i + 1), X, Y + 0.5, Math.max(7, ts * 0.28), '#0b0f12', 'center', 800);
@@ -669,16 +839,18 @@ export class Game {
     }
   }
 
-  private drawBreakpoint(x: number, y: number, emphasis: boolean) {
-    const ctx = this.ctx, ts = this.ts, X = this.sx(x), Y = this.sy(y), r = ts * 0.32;
-    ctx.globalAlpha = emphasis ? 1 : 0.7;
-    ctx.fillStyle = C.hold;
+  /** Breakpoint marker: a diamond in the go code's color with its letter. Called codes show hollow. */
+  private drawBreakpoint(x: number, y: number, code: GoCode, emphasis: boolean, fired = false) {
+    const ctx = this.ctx, ts = this.ts, X = this.sx(x), Y = this.sy(y), r = ts * 0.38;
+    ctx.globalAlpha = emphasis ? 1 : 0.75;
     ctx.beginPath();
     ctx.moveTo(X, Y - r); ctx.lineTo(X + r, Y); ctx.lineTo(X, Y + r); ctx.lineTo(X - r, Y); ctx.closePath();
-    ctx.fill();
-    ctx.fillStyle = '#0b0f12';
-    ctx.fillRect(X - r * 0.32, Y - r * 0.38, r * 0.2, r * 0.76);
-    ctx.fillRect(X + r * 0.12, Y - r * 0.38, r * 0.2, r * 0.76);
+    if (fired) {
+      ctx.strokeStyle = CODE_COLORS[code]; ctx.lineWidth = 1.5; ctx.stroke();
+    } else {
+      ctx.fillStyle = CODE_COLORS[code]; ctx.fill();
+      text(ctx, code, X, Y + 1, Math.max(7, r * 0.95), '#0b0f12', 'center', 900);
+    }
     ctx.globalAlpha = 1;
   }
 
@@ -689,8 +861,10 @@ export class Game {
     // zones
     const dz = m.deploy[PLAYER], fz = m.fortify[PLAYER];
     ctx.fillStyle = C.teamDim[PLAYER];
+    const dragType = this.down?.dragUnit ? this.units.find((u) => u.id === this.down!.dragUnit)?.type : undefined;
+    const zoneCls = (this.placing?.kind === 'unit' && this.placing.type === 'tank') || dragType === 'tank' ? 'vehicle' : 'foot';
     for (let y = 0; y < m.h; y++)
-      for (let x = dz.x0; x <= dz.x1; x++) if (canDeployUnit(m, PLAYER, x, y)) ctx.fillRect(this.sx(x), this.sy(y), ts, ts);
+      for (let x = dz.x0; x <= dz.x1; x++) if (canDeployUnit(m, PLAYER, x, y, zoneCls)) ctx.fillRect(this.sx(x), this.sy(y), ts, ts);
     if (this.placing?.kind === 'def') {
       ctx.strokeStyle = 'rgba(78,168,255,0.5)';
       ctx.setLineDash([6, 4]);
@@ -721,7 +895,7 @@ export class Game {
     if (this.dragTile && this.down?.dragUnit) {
       const u = this.units.find((v) => v.id === this.down!.dragUnit);
       const t = this.dragTile;
-      const ok = canDeployUnit(m, PLAYER, t.x, t.y) && !this.occupied(t.x, t.y);
+      const ok = !!u && canDeployUnit(m, PLAYER, t.x, t.y, this.cls(u.type)) && !this.occupied(t.x, t.y);
       if (u) this.drawUnitGlyph(t.x + 0.5, t.y + 0.5, PLAYER, u.type, this.units.indexOf(u) + 1, 0, { alpha: 0.8, ring: ok ? C.ok : C.danger });
     }
     if (!this.side) this.drawSelectionTools();
@@ -734,7 +908,14 @@ export class Game {
     const alpha = Math.min(1, this.acc / TICK);
     // corpses & wrecks under everything
     for (const f of this.effects) {
-      if (f.kind === 'corpse') {
+      if (f.kind === 'corpse' && f.tank) {
+        ctx.globalAlpha = 0.55;
+        ctx.fillStyle = '#1a1d1f';
+        ctx.fillRect(this.sx(f.x) - ts * 0.45, this.sy(f.y) - ts * 0.33, ts * 0.9, ts * 0.66);
+        ctx.strokeStyle = C.team[f.team]; ctx.lineWidth = 1.5;
+        ctx.strokeRect(this.sx(f.x) - ts * 0.45, this.sy(f.y) - ts * 0.33, ts * 0.9, ts * 0.66);
+        ctx.globalAlpha = 1;
+      } else if (f.kind === 'corpse') {
         ctx.strokeStyle = C.team[f.team]; ctx.globalAlpha = 0.5; ctx.lineWidth = 2;
         const X = this.sx(f.x), Y = this.sy(f.y), r = ts * 0.22;
         ctx.beginPath(); ctx.moveTo(X - r, Y - r); ctx.lineTo(X + r, Y + r); ctx.moveTo(X + r, Y - r); ctx.lineTo(X - r, Y + r); ctx.stroke();
@@ -760,24 +941,26 @@ export class Game {
     // own remaining paths
     for (const u of sim.units) {
       if (u.team !== PLAYER || u.state === 'dead' || u.pi >= u.path.length) continue;
-      this.drawPath({ x: u.x, y: u.y }, u.path.slice(u.pi), null, u.state === 'recalling' ? C.danger : C.team[PLAYER], u.state === 'holding');
+      this.drawPath({ x: u.x, y: u.y }, u.path.slice(u.pi), null, u.state === 'recalling' ? C.danger : C.team[PLAYER], u.state === 'holding', sim.fired[PLAYER]);
     }
 
     // tracers / explosions
     for (const f of this.effects) {
       const age = this.now - f.t0;
-      if (f.kind === 'tracer' && age < 140) {
-        ctx.globalAlpha = 1 - age / 140;
-        ctx.strokeStyle = f.team === PLAYER ? '#bfe0ff' : '#ffc2b5';
-        ctx.lineWidth = f.heavy ? 2.5 : 1.3;
+      if (f.kind === 'tracer') {
+        const style = TRACERS[f.dtype];
+        if (age > style.life) continue;
+        ctx.globalAlpha = 1 - age / style.life;
+        ctx.strokeStyle = style.color ?? (f.team === PLAYER ? '#bfe0ff' : '#ffc2b5');
+        ctx.lineWidth = style.width;
         ctx.beginPath(); ctx.moveTo(this.sx(f.fx), this.sy(f.fy)); ctx.lineTo(this.sx(f.tx), this.sy(f.ty)); ctx.stroke();
         if (f.hit) { ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(this.sx(f.tx), this.sy(f.ty), ts * 0.1, 0, Math.PI * 2); ctx.fill(); }
         ctx.globalAlpha = 1;
-      } else if (f.kind === 'boom' && age < 700) {
-        const k = age / 700;
+      } else if (f.kind === 'boom' && age < 600) {
+        const k = age / 600;
         ctx.globalAlpha = 1 - k;
         ctx.fillStyle = '#ffb347';
-        ctx.beginPath(); ctx.arc(this.sx(f.x), this.sy(f.y), ts * RULES.mineBlastRadius * (0.3 + 0.7 * k), 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath(); ctx.arc(this.sx(f.x), this.sy(f.y), ts * f.r * (0.3 + 0.7 * k), 0, Math.PI * 2); ctx.fill();
         ctx.globalAlpha = 1;
       }
     }
@@ -788,8 +971,14 @@ export class Game {
       if (u.state === 'dead') continue;
       if (u.team !== PLAYER && !this.visible.has(u.id)) continue;
       const x = u.px + (u.x - u.px) * alpha, y = u.py + (u.y - u.py) * alpha;
-      const ring = u.team !== PLAYER ? undefined : u.state === 'holding' ? `rgba(255,210,63,${0.4 + 0.6 * pulse})` : u.state === 'recalling' || u.state === 'home' ? C.danger : undefined;
-      this.drawUnitGlyph(x, y, u.team, u.type, u.num, u.facing, { hpFrac: u.hp / u.maxHp, ring });
+      const holdCol = u.holdCode ? CODE_COLORS[u.holdCode] : C.hold;
+      const ring = u.team !== PLAYER ? undefined : u.state === 'holding' ? withAlpha(holdCol, 0.4 + 0.6 * pulse) : u.state === 'recalling' || u.state === 'home' ? C.danger : undefined;
+      // Hull points where the tank is driving; the turret (facing) tracks targets.
+      if (u.type === 'tank' && (u.x !== u.px || u.y !== u.py)) this.hulls.set(u.id, Math.atan2(u.y - u.py, u.x - u.px));
+      this.drawUnitGlyph(x, y, u.team, u.type, u.num, u.facing, {
+        hpFrac: u.hp / u.maxHp, ring, suppressed: sim.isSuppressed(u), hull: this.hulls.get(u.id) ?? u.facing,
+        code: u.team === PLAYER && u.state === 'holding' ? u.holdCode : null,
+      });
     }
   }
 
@@ -808,15 +997,15 @@ export class Game {
   }
 
   /** Lay out n equal cells along the panel (vertical stack on the side, row along the bottom). */
-  private cells(n: number, pad = 8, gap = 6, reserve = 0): Rect[] {
+  private cells(n: number, pad = 8, gap = 6, reserve = 0, lead = 0): Rect[] {
     const p = this.panel;
     const out: Rect[] = [];
     if (this.side) {
-      const h = Math.min(64, (p.h - pad * 2 - gap * (n - 1) - reserve) / n);
-      for (let i = 0; i < n; i++) out.push({ x: p.x + pad, y: p.y + pad + i * (h + gap), w: p.w - pad * 2, h });
+      const h = Math.min(64, (p.h - pad * 2 - gap * (n - 1) - reserve - lead) / n);
+      for (let i = 0; i < n; i++) out.push({ x: p.x + pad, y: p.y + pad + lead + i * (h + gap), w: p.w - pad * 2, h });
     } else {
-      const w = Math.min(150, (p.w - pad * 2 - gap * (n - 1) - reserve) / n);
-      const x0 = p.x + (p.w - (w * n + gap * (n - 1) + reserve)) / 2;
+      const w = Math.min(150, (p.w - pad * 2 - gap * (n - 1) - reserve - lead) / n);
+      const x0 = p.x + lead + (p.w - lead - (w * n + gap * (n - 1) + reserve)) / 2;
       for (let i = 0; i < n; i++) out.push({ x: x0 + i * (w + gap), y: p.y + pad, w, h: p.h - pad * 2 });
     }
     return out;
@@ -835,48 +1024,74 @@ export class Game {
   private drawSelectionTools() {
     const s = this.selected;
     if (!s) return;
-    const btns: [string, () => void, string?][] = [];
+    const ctx = this.ctx;
+    type Btn = { label: string; fn: () => void; color?: string; fill?: string };
+    const codeRow: Btn[] = [];
+    const btns: Btn[] = [];
     let title = '';
     let sub = '';
+    let sub2 = '';
     if (s.kind === 'unit') {
       const u = this.selUnit();
       if (!u) return;
-      title = `${this.units.indexOf(u) + 1} · ${UNITS[u.type].name}`;
-      sub = u.veteran ? 'Veteran' : UNITS[u.type].blurb;
+      const st = UNITS[u.type];
+      title = `${this.units.indexOf(u) + 1} · ${st.name}${u.veteran ? ' ★' : ''}`;
+      sub = `Strong: ${st.strong}`;
+      sub2 = `Weak: ${st.weak}`;
       const last = u.waypoints[u.waypoints.length - 1];
-      if (last) btns.push([last.hold ? 'Remove hold' : 'Hold here', () => { last.hold = !last.hold; }, C.hold]);
-      if (u.waypoints.length) btns.push(['Undo waypoint', () => { u.waypoints.pop(); }]);
-      if (u.waypoints.length) btns.push(['Clear route', () => { u.waypoints = []; }]);
-      if (!u.veteran) btns.push([`Sell  +$${UNITS[u.type].cost}`, () => this.sellSelected(), C.danger]);
+      if (last) {
+        for (const c of [null, ...GO_CODES] as (GoCode | null)[]) {
+          const on = last.code === c;
+          codeRow.push({
+            label: c ?? '—', fn: () => { last.code = c; },
+            color: c ? CODE_COLORS[c] : C.dim, fill: on ? (c ? withAlpha(CODE_COLORS[c], 0.3) : C.buttonHi) : undefined,
+          });
+        }
+      }
+      if (u.waypoints.length) btns.push({ label: 'Undo waypoint', fn: () => { u.waypoints.pop(); } });
+      if (u.waypoints.length) btns.push({ label: 'Clear route', fn: () => { u.waypoints = []; } });
+      if (!u.veteran) btns.push({ label: `Sell  +$${st.cost}`, fn: () => this.sellSelected(), color: C.danger });
     } else {
       const d = this.defenses[s.index];
       if (!d) return;
       title = DEFENSES[d.type].name;
       sub = DEFENSES[d.type].blurb;
-      btns.push([`Sell  +$${DEFENSES[d.type].cost}`, () => this.sellSelected(), C.danger]);
+      btns.push({ label: `Sell  +$${DEFENSES[d.type].cost}`, fn: () => this.sellSelected(), color: C.danger });
     }
-    btns.push(['Done', () => { this.selected = null; }, C.ok]);
-    const ctx = this.ctx;
+    btns.push({ label: 'Done', fn: () => { this.selected = null; }, color: C.ok });
 
     if (this.side) {
       // Replace the shop with the tools for the selection.
       const p = this.panel, pad = 8;
       this.hits.push({ ...p, fn: () => {} });
-      text(ctx, title, p.x + pad + 2, p.y + 18, 15, C.text, 'left', 800);
-      text(ctx, sub, p.x + pad + 2, p.y + 38, 11, C.dim, 'left', 500);
-      if (s.kind === 'unit' && !this.selUnit()!.waypoints.length) text(ctx, 'Tap the map to route', p.x + pad + 2, p.y + 56, 11, C.hold, 'left', 700);
-      const bh = Math.min(44, (p.h - 72 - btns.length * 6) / btns.length);
-      btns.forEach(([l, fn, col], i) => {
-        const y = p.y + p.h - pad - (btns.length - i) * (bh + 6) + 6;
-        this.button({ x: p.x + pad, y, w: p.w - pad * 2, h: bh }, l, fn, { color: col, size: 14 });
+      const tw = p.w - pad * 2 - 4;
+      let y = p.y + 18;
+      fitText(ctx, title, p.x + pad + 2, y, tw, 15, C.text, 'left', 800);
+      y += 20;
+      if (sub) { fitText(ctx, sub, p.x + pad + 2, y, tw, 11, C.ok, 'left', 600, 8); y += 15; }
+      if (sub2) { fitText(ctx, sub2, p.x + pad + 2, y, tw, 11, C.danger, 'left', 600, 8); y += 15; }
+      y += 6;
+      if (s.kind === 'unit') {
+        if (codeRow.length) {
+          text(ctx, 'Last waypoint go code', p.x + pad + 2, y, 11, C.dim, 'left', 700);
+          y += 10;
+          const cw = (p.w - pad * 2 - 3 * 5) / 4;
+          codeRow.forEach((b, i) => this.button({ x: p.x + pad + i * (cw + 5), y, w: cw, h: 34 }, b.label, b.fn, { color: b.color, fill: b.fill, size: 15 }));
+          y += 42;
+        } else text(ctx, 'Tap the map to route', p.x + pad + 2, y, 12, C.hold, 'left', 700);
+      }
+      const bh = Math.min(42, (p.y + p.h - y - pad - btns.length * 6) / btns.length);
+      btns.forEach((b, i) => {
+        const by = p.y + p.h - pad - (btns.length - i) * (bh + 6) + 6;
+        this.button({ x: p.x + pad, y: by, w: p.w - pad * 2, h: bh }, b.label, b.fn, { color: b.color, size: 14 });
       });
       return;
     }
-    const h = 36, gap = 8, y = this.panel.y - h - 10;
+    const h = 36, gap = 6, y = this.panel.y - h - 10;
     ctx.font = '700 14px system-ui';
-    const widths = btns.map(([l]) => Math.max(64, ctx.measureText(l).width + 24));
-    const titleW = Math.max(110, ctx.measureText(title).width + 24);
-    const total = titleW + widths.reduce((a, b) => a + b + gap, 0);
+    const all = [...codeRow.map((b) => ({ ...b, w: 36 })), ...btns.map((b) => ({ ...b, w: Math.max(64, ctx.measureText(b.label).width + 24) }))];
+    const titleW = Math.max(120, ctx.measureText(title).width + 24);
+    const total = titleW + all.reduce((a, b) => a + b.w + gap, 0);
     let x = Math.max(8, (this.W - total) / 2);
     const panel: Rect = { x: x - 6, y: y - 6, w: total + 6, h: h + 12 };
     roundRect(ctx, panel, 10);
@@ -885,20 +1100,31 @@ export class Game {
     this.hits.push({ ...panel, fn: () => {} });
     text(ctx, title, x + 8, y + h / 2, 14, C.text, 'left', 700);
     x += titleW;
-    btns.forEach(([l, fn, col], i) => {
-      this.button({ x, y, w: widths[i], h }, l, fn, { color: col });
-      x += widths[i] + gap;
-    });
+    for (const b of all) {
+      this.button({ x, y, w: b.w, h }, b.label, b.fn, { color: b.color, fill: b.fill });
+      x += b.w + gap;
+    }
   }
 
   private drawShop() {
     const ctx = this.ctx;
     this.panelBg();
     if (this.side && this.selected) { this.drawSelectionTools(); return; }
-    const rects = this.cells(SHOP.length, 8, 5, 8);
-    SHOP.forEach((item, i) => {
-      const r = { ...rects[i] };
-      if (i >= 4) { if (this.side) r.y += 8; else r.x += 8; } // gap between units and defenses
+    const items = this.shopTab === 'unit' ? SHOP_UNITS : SHOP_DEFS;
+    // tabs
+    const p = this.panel, pad = 8;
+    const tabLead = this.side ? 38 : 76;
+    const tabs: ['unit' | 'def', string][] = [['unit', 'UNITS'], ['def', 'DEFENSES']];
+    tabs.forEach(([k, label], i) => {
+      const r: Rect = this.side
+        ? { x: p.x + pad + i * ((p.w - pad * 2) / 2 + 2), y: p.y + pad, w: (p.w - pad * 2) / 2 - 2, h: 30 }
+        : { x: p.x + pad, y: p.y + pad + i * ((p.h - pad * 2) / 2 + 2), w: 70, h: (p.h - pad * 2) / 2 - 2 };
+      const on = this.shopTab === k;
+      this.button(r, label, () => { this.shopTab = k; this.placing = null; }, { color: on ? C.text : C.dim, fill: on ? C.buttonHi : 'transparent', size: 12 });
+    });
+    const rects = this.cells(items.length, 8, 5, 0, tabLead);
+    items.forEach((item, i) => {
+      const r = rects[i];
       const why = this.canBuy(item);
       const active = this.placing?.kind === item.kind && this.placing.type === item.type;
       roundRect(ctx, r, 8);
@@ -911,27 +1137,24 @@ export class Game {
       ctx.globalAlpha = alpha;
       const cost = `$${itemCost(item)}`;
       const costCol = item.kind === 'unit' ? C.ok : C.hold;
+      const glyph = (gx: number, gy: number, g: number) => this.glyphAt(g, () => {
+        if (item.kind === 'unit') this.drawUnitGlyph(gx / g, gy / g, PLAYER, item.type, 0, -Math.PI / 2, { alpha });
+        else this.drawDefense({ type: item.type, x: gx / g - 0.5, y: gy / g - 0.5, team: PLAYER }, alpha);
+      });
       if (this.side) {
-        const g = Math.min(r.h * 0.62, 30);
-        const gx = r.x + 6 + g / 2, gy = r.y + r.h / 2;
-        this.glyphAt(g, () => {
-          if (item.kind === 'unit') this.drawUnitGlyph(gx / g, gy / g, PLAYER, item.type, 0, -Math.PI / 2, { alpha });
-          else this.drawDefense({ type: item.type, x: gx / g - 0.5, y: gy / g - 0.5, team: PLAYER }, alpha);
-        });
+        const g = Math.min(r.h * 0.62, 28);
+        glyph(r.x + 6 + g / 2, r.y + r.h / 2, g);
         ctx.globalAlpha = alpha;
-        const fs = Math.max(11, Math.min(14, r.h * 0.3));
-        text(ctx, itemName(item), r.x + g + 12, r.y + r.h / 2 + 1, fs, C.text, 'left', 700);
+        const fs = Math.max(11, Math.min(14, r.h * 0.32));
         text(ctx, cost, r.x + r.w - 8, r.y + r.h / 2 + 1, fs * 0.92, costCol, 'right', 700);
+        const costW = ctx.measureText(cost).width;
+        fitText(ctx, itemName(item), r.x + g + 12, r.y + r.h / 2 + 1, r.w - g - 26 - costW, fs, C.text, 'left', 700);
       } else {
-        const g = Math.min(r.h * 0.42, r.w * 0.38);
-        const gx = r.x + r.w / 2, gy = r.y + r.h * 0.32;
-        this.glyphAt(g, () => {
-          if (item.kind === 'unit') this.drawUnitGlyph(gx / g, gy / g, PLAYER, item.type, 0, -Math.PI / 2, { alpha });
-          else this.drawDefense({ type: item.type, x: gx / g - 0.5, y: gy / g - 0.5, team: PLAYER }, alpha);
-        });
+        const g = Math.min(r.h * 0.4, r.w * 0.36);
+        glyph(r.x + r.w / 2, r.y + r.h * 0.32, g);
         ctx.globalAlpha = alpha;
-        const fs = Math.max(10, Math.min(15, r.w * 0.13, r.h * 0.2));
-        text(ctx, itemName(item), r.x + r.w / 2, r.y + r.h * 0.7, fs, C.text, 'center', 700);
+        const fs = Math.max(10, Math.min(14, r.w * 0.13, r.h * 0.19));
+        fitText(ctx, itemName(item), r.x + r.w / 2, r.y + r.h * 0.7, r.w - 8, fs, C.text, 'center', 700);
         text(ctx, cost, r.x + r.w / 2, r.y + r.h * 0.88, fs * 0.9, costCol, 'center', 700);
       }
       ctx.globalAlpha = 1;
@@ -945,8 +1168,9 @@ export class Game {
     const ctx = this.ctx;
     this.panelBg();
     const mine = sim.units.filter((u) => u.team === PLAYER);
-    const goAll = this.side ? 52 : 84;
-    const rects = this.cells(Math.max(1, mine.length), 8, 6, goAll + 6);
+    const p = this.panel;
+    const codeArea = this.side ? 62 : 3 * 64 + 12;
+    const rects = this.cells(Math.max(1, mine.length), 8, 6, codeArea + 6);
     const pulse = 0.5 + 0.5 * Math.sin(this.now / 160);
     const live = this.phase === 'live' && !sim.result;
     mine.forEach((u, i) => {
@@ -954,9 +1178,10 @@ export class Game {
       const dead = u.state === 'dead';
       const holding = u.state === 'holding';
       const canRecall = live && (u.state === 'moving' || u.state === 'holding' || u.state === 'done');
+      const holdCol = u.holdCode ? CODE_COLORS[u.holdCode] : C.hold;
       let main: Rect, rec: Rect;
       if (this.side) {
-        const rw = Math.min(54, r.w * 0.36);
+        const rw = Math.min(46, r.w * 0.3);
         main = { x: r.x, y: r.y, w: r.w - rw - 5, h: r.h };
         rec = { x: r.x + r.w - rw, y: r.y, w: rw, h: r.h };
       } else {
@@ -964,20 +1189,21 @@ export class Game {
         rec = { x: r.x, y: r.y + r.h * 0.68, w: r.w, h: r.h * 0.32 };
       }
       roundRect(ctx, main, 8);
-      ctx.fillStyle = holding ? `rgba(255,210,63,${0.18 + 0.25 * pulse})` : C.button;
+      ctx.fillStyle = holding ? withAlpha(holdCol, 0.15 + 0.22 * pulse) : C.button;
       ctx.fill();
-      ctx.strokeStyle = holding ? C.hold : C.panelEdge;
+      ctx.strokeStyle = holding ? holdCol : C.panelEdge;
       ctx.lineWidth = holding ? 2 : 1;
       ctx.stroke();
       ctx.globalAlpha = dead ? 0.35 : 1;
-      const g = Math.min(main.h * 0.55, 28);
-      const gx = main.x + 6 + g / 2, gy = main.y + main.h * 0.45;
-      this.glyphAt(g, () => this.drawUnitGlyph(gx / g, gy / g, PLAYER, u.type, u.num, -Math.PI / 2));
+      const g = Math.min(main.h * 0.55, 26);
+      const gx = main.x + 6 + g / 2, gy = main.y + main.h * 0.47;
+      this.glyphAt(g, () => this.drawUnitGlyph(gx / g, gy / g, PLAYER, u.type, u.num, -Math.PI / 2, { code: holding ? u.holdCode : null }));
       ctx.globalAlpha = dead ? 0.35 : 1;
-      const fs = Math.max(10, Math.min(14, main.w * 0.11, main.h * 0.28));
-      const label = dead ? 'KIA' : holding ? 'GO ▶' : u.state === 'moving' ? 'Moving' : u.state === 'done' ? 'In position' : u.state === 'recalling' ? 'Falling back' : 'Home';
+      const fs = Math.max(10, Math.min(13, main.w * 0.11, main.h * 0.28));
+      const label = dead ? 'KIA' : holding ? 'GO ▶' : u.state === 'moving' ? (u.engaged ? 'Engaging' : 'Moving')
+        : u.state === 'done' ? (u.engaged ? 'Engaging' : 'In position') : u.state === 'recalling' ? 'Falling back' : 'Home';
       const lx = main.x + g + 14;
-      text(ctx, label, lx, main.y + main.h * 0.38, holding ? fs * 1.15 : fs, holding ? C.hold : C.text, 'left', 800);
+      fitText(ctx, label, lx, main.y + main.h * 0.36, main.x + main.w - lx - 6, holding ? fs * 1.1 : fs, holding ? holdCol : u.engaged ? C.danger : C.text, 'left', 800);
       bar(ctx, { x: lx, y: main.y + main.h * 0.66, w: main.x + main.w - lx - 8, h: 5 }, u.hp / u.maxHp, u.hp / u.maxHp > 0.35 ? C.ok : C.danger);
       ctx.globalAlpha = 1;
       if (holding && live) this.hits.push({ ...main, fn: () => this.command(u, 'go') });
@@ -988,17 +1214,33 @@ export class Game {
       ctx.lineWidth = 1;
       ctx.stroke();
       const rl = dead ? '—' : u.state === 'home' || u.state === 'recalling' ? 'HOME' : this.side ? '⟲' : '⟲ RECALL';
-      text(ctx, rl, rec.x + rec.w / 2, rec.y + rec.h / 2 + 1, this.side && rl === '⟲' ? 22 : Math.max(9, fs * 0.85), canRecall ? C.danger : C.dim, 'center', 800);
+      text(ctx, rl, rec.x + rec.w / 2, rec.y + rec.h / 2 + 1, this.side && rl === '⟲' ? 20 : Math.max(9, fs * 0.85), canRecall ? C.danger : C.dim, 'center', 800);
       if (canRecall) this.hits.push({ ...rec, fn: () => this.command(u, 'recall') });
     });
-    const anyHolding = mine.some((u) => u.state === 'holding');
-    const p = this.panel;
-    const goRect: Rect = this.side
-      ? { x: p.x + 8, y: p.y + p.h - 8 - goAll, w: p.w - 16, h: goAll }
-      : (() => { const last = rects[rects.length - 1]; return { x: last.x + last.w + 6, y: last.y, w: goAll, h: last.h }; })();
-    this.button(goRect, 'GO ALL', () => {
-      for (const u of mine) if (u.state === 'holding') this.command(u, 'go');
-    }, { color: anyHolding && live ? C.hold : C.dim, disabled: !anyHolding || !live, size: 15 });
+
+    // Go code buttons. Calling a code early opens it: units arriving later walk straight through.
+    const area: Rect = this.side
+      ? { x: p.x + 8, y: p.y + p.h - 8 - codeArea + 6, w: p.w - 16, h: codeArea - 6 }
+      : (() => { const last = rects[rects.length - 1]; return { x: last.x + last.w + 6, y: last.y, w: codeArea, h: last.h }; })();
+    const cw = (area.w - 2 * 6) / 3;
+    GO_CODES.forEach((code, i) => {
+      const r: Rect = { x: area.x + i * (cw + 6), y: area.y, w: cw, h: area.h };
+      const fired = sim.fired[PLAYER].has(code);
+      const waiting = mine.filter((u) => u.state === 'holding' && u.holdCode === code).length;
+      const pending = mine.filter((u) => u.state === 'moving' && u.path.slice(u.pi).some((n) => n.bp === code)).length;
+      const col = CODE_COLORS[code];
+      const usable = live && !fired;
+      roundRect(ctx, r, 8);
+      ctx.fillStyle = fired ? 'rgba(255,255,255,0.03)' : waiting ? withAlpha(col, 0.15 + 0.25 * pulse) : C.button;
+      ctx.fill();
+      ctx.strokeStyle = fired ? C.panelEdge : waiting || pending ? col : withAlpha(col, 0.35);
+      ctx.lineWidth = waiting ? 2 : 1;
+      ctx.stroke();
+      text(ctx, fired ? '✓' : code, r.x + r.w / 2, r.y + r.h * 0.36, Math.min(22, r.h * 0.4), fired ? C.dim : col, 'center', 900);
+      const sub = fired ? 'called' : waiting ? `${waiting} ready` : pending ? `${pending} en route` : CODE_NAMES[code];
+      text(ctx, sub, r.x + r.w / 2, r.y + r.h * 0.74, Math.max(9, Math.min(11, r.w * 0.16)), fired ? C.dim : C.text, 'center', 700);
+      if (usable) this.hits.push({ ...r, fn: () => this.callCode(code) });
+    });
   }
 
   // ======================= HUD / overlays =======================
@@ -1041,8 +1283,9 @@ export class Game {
     if (!t || this.now > t.until) return;
     const ctx = this.ctx;
     ctx.font = '700 14px system-ui';
-    const w = Math.min(this.W - 24, ctx.measureText(t.msg).width + 28);
-    const r: Rect = { x: (this.W - w) / 2, y: this.top + 10, w, h: 32 };
+    const areaW = this.side ? this.panel.x : this.W;
+    const w = Math.min(areaW - 24, ctx.measureText(t.msg).width + 28);
+    const r: Rect = { x: (areaW - w) / 2, y: this.top + 10, w, h: 32 };
     ctx.globalAlpha = Math.min(1, (t.until - this.now) / 300);
     roundRect(ctx, r, 16);
     ctx.fillStyle = 'rgba(10,14,17,0.92)';
@@ -1050,7 +1293,7 @@ export class Game {
     ctx.strokeStyle = t.color;
     ctx.lineWidth = 1;
     ctx.stroke();
-    text(ctx, t.msg, this.W / 2, r.y + 17, 13, t.color, 'center', 700);
+    fitText(ctx, t.msg, r.x + r.w / 2, r.y + 17, r.w - 20, 13, t.color, 'center', 700, 9);
     ctx.globalAlpha = 1;
   }
 
@@ -1098,17 +1341,17 @@ export class Game {
   private drawTitle() {
     const ctx = this.ctx;
     const rules = [
-      ['1', 'Each round you get 60s to buy units and defenses and draw each unit’s route.'],
-      ['2', 'Tap a waypoint to make it a breakpoint. Units wait there for your GO.'],
-      ['3', 'Then it plays out live. Tap a flashing card to send that unit on.'],
-      ['4', 'Win by wiping the enemy, or by hitting their base when nobody guards it.'],
-      ['5', '⟲ RECALL sends a unit home for good. Everyone home = draw.'],
-      ['6', 'Survivors carry over. Money rolls over. First to 5 rounds wins.'],
+      ['1', 'Each round: 60s to buy units and defenses and route every unit.'],
+      ['2', 'Tap a waypoint to tag it ALPHA, BRAVO or CHARLIE. Units hold there.'],
+      ['3', 'Live: call a go code to release everyone holding on it, together.'],
+      ['4', 'Tanks crush infantry. Rocketeers kill tanks. Rifles kill rocketeers.'],
+      ['5', 'Hold buildings: windows to shoot from, walls that stop bullets.'],
+      ['6', 'Win by wiping them out or hitting an unguarded base. First to 5.'],
     ];
-    const fs = Math.max(11, Math.min(16, this.W * 0.021, this.H * 0.036));
-    const big = Math.min(64, this.W * 0.1, this.H * 0.12);
-    const bh = Math.min(52, Math.max(40, this.H * 0.11)), bw = 220;
-    const total = big + fs * 2.2 + rules.length * fs * 1.9 + 16 + bh;
+    const fs = Math.max(11, Math.min(16, this.W * 0.021, this.H * 0.034));
+    const big = Math.min(64, this.W * 0.1, this.H * 0.11);
+    const bh = Math.min(50, Math.max(38, this.H * 0.1)), bw = 220;
+    const total = big + fs * 2.2 + rules.length * fs * 1.85 + 16 + bh + 44;
     let y = Math.max(8, (this.H - total) / 2) + big / 2;
     text(ctx, 'WARGAMES', this.W / 2, y, big, C.text, 'center', 900);
     y += big * 0.5 + fs * 1.1;
@@ -1122,9 +1365,19 @@ export class Game {
       ctx.beginPath(); ctx.arc(x0 + fs * 0.6, y, fs * 0.68, 0, Math.PI * 2); ctx.fill();
       text(ctx, n, x0 + fs * 0.6, y + 1, fs * 0.85, '#0b0f12', 'center', 800);
       text(ctx, s, x0 + fs * 1.9, y, fs, C.text, 'left', 500);
-      y += fs * 1.9;
+      y += fs * 1.85;
     }
-    this.button({ x: (this.W - bw) / 2, y: y + 6, w: bw, h: bh }, 'DEPLOY ▶', () => this.startMatch(), { color: C.ok, size: 20 });
+    // map picker
+    y += 4;
+    const mw = 150, gap = 8;
+    let mx = (this.W - (MAP_ORDER.length * mw + (MAP_ORDER.length - 1) * gap)) / 2;
+    for (const id of MAP_ORDER) {
+      const on = id === this.mapId;
+      this.button({ x: mx, y, w: mw, h: 34 }, MAPS[id].name, () => { this.mapId = id; }, { color: on ? C.text : C.dim, fill: on ? C.buttonHi : 'transparent', size: 14 });
+      mx += mw + gap;
+    }
+    text(ctx, MAPS[this.mapId].blurb, this.W / 2, y + 46, Math.max(11, fs * 0.85), C.dim, 'center', 500);
+    this.button({ x: (this.W - bw) / 2, y: y + 62, w: bw, h: bh }, 'DEPLOY ▶', () => this.startMatch(), { color: C.ok, size: 20 });
     if (this.H > this.W * 1.05) this.drawRotateHint();
   }
 

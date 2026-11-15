@@ -1,5 +1,8 @@
-import { DEFENSES, RULES, UNITS, other, type DefenseType, type Team, type UnitType } from './config';
-import { type GameMap, type Pt, key, tileAt } from './map';
+import {
+  DAMAGE, DEFENSES, GARRISON, RULES, UNITS, other,
+  type ArmorClass, type DamageType, type DefenseType, type GoCode, type MoveClass, type Team, type UnitType,
+} from './config';
+import { type GameMap, type Pt, conceals, garrisoned, key, speedMult, tileAt } from './map';
 import { expandPlan, findPath, type PathNode, type Waypoint } from './path';
 import { hasLos, inCover } from './los';
 import { Rng } from './rng';
@@ -15,10 +18,13 @@ export interface UnitPlan {
 export interface DefensePlan { type: DefenseType; x: number; y: number }
 export interface TeamPlan { units: UnitPlan[]; defenses: DefensePlan[] }
 
-/** Tiles a team's own pathing must avoid: its own move-blocking defenses. */
-export function ownBlocked(defs: DefensePlan[]): Set<number> {
+/** Tiles a team's own pathing must avoid: its own defenses that block that movement class. */
+export function ownBlocked(defs: DefensePlan[], cls: MoveClass = 'foot'): Set<number> {
   const s = new Set<number>();
-  for (const d of defs) if (DEFENSES[d.type].blocksMove) s.add(key(d.x, d.y));
+  for (const d of defs) {
+    const st = DEFENSES[d.type];
+    if (cls === 'foot' ? st.blocksFoot : st.blocksVehicle) s.add(key(d.x, d.y));
+  }
   return s;
 }
 
@@ -31,16 +37,20 @@ export interface Unit {
   num: number; // 1-based label shown on map + card
   team: Team;
   type: UnitType;
+  cls: MoveClass;
   x: number; y: number;
   px: number; py: number; // previous tick position, for render interpolation
   hp: number; maxHp: number;
   state: UnitState;
+  holdCode: GoCode | null; // which code a holding unit is waiting on
   path: PathNode[];
   pi: number; // index of next path node
   cooldown: number;
   spawn: Pt;
   revealUntil: number; // tick until which firing has revealed this unit to the enemy
+  suppressedUntil: number;
   facing: number;
+  engaged: boolean; // had a target this tick
 }
 
 export interface Defense {
@@ -55,13 +65,16 @@ export interface Defense {
 
 export interface Base { team: Team; x: number; y: number; hp: number; maxHp: number }
 
-export type Command = { team: Team; unitId: string; kind: 'go' | 'recall' };
+export type Command =
+  | { team: Team; kind: 'go' | 'recall'; unitId: string }
+  | { team: Team; kind: 'code'; code: GoCode };
 
 export type SimEvent =
-  | { kind: 'shot'; team: Team; shooter: string; fx: number; fy: number; tx: number; ty: number; hit: boolean; heavy: boolean }
-  | { kind: 'boom'; team: Team; x: number; y: number }
+  | { kind: 'shot'; team: Team; shooter: string; fx: number; fy: number; tx: number; ty: number; hit: boolean; dtype: DamageType }
+  | { kind: 'boom'; team: Team; x: number; y: number; r: number }
   | { kind: 'death'; team: Team; id: string; x: number; y: number }
-  | { kind: 'wreck'; team: Team; id: string; x: number; y: number };
+  | { kind: 'wreck'; team: Team; id: string; x: number; y: number }
+  | { kind: 'code'; team: Team; code: GoCode };
 
 export interface RoundResult {
   winner: Team | null;
@@ -69,6 +82,7 @@ export interface RoundResult {
   kills: [number, number];
   baseDestroyed: Team | null;
   survivors: [UnitPlan[], UnitPlan[]];
+  fielded: [UnitType[], UnitType[]];
   ticks: number;
 }
 
@@ -78,25 +92,31 @@ type Target =
   | { kind: 'base'; b: Base };
 
 const DT = 1 / RULES.tickRate;
+const armorOf = (t: Target): ArmorClass => (t.kind === 'unit' ? UNITS[t.u.type].armor : 'structure');
+const posOf = (t: Target): Pt =>
+  t.kind === 'unit' ? { x: t.u.x, y: t.u.y } : t.kind === 'def' ? { x: t.d.x + 0.5, y: t.d.y + 0.5 } : { x: t.b.x, y: t.b.y };
 
 export class Sim {
   readonly units: Unit[] = [];
   readonly defenses: Defense[] = [];
   readonly bases: [Base, Base];
+  readonly fired: [Set<GoCode>, Set<GoCode>] = [new Set(), new Set()];
   tick = 0;
   events: SimEvent[] = [];
   result: RoundResult | null = null;
   private kills: [number, number] = [0, 0];
   private lastAction = 0;
   private rng: Rng;
-  private blocked: [Set<number>, Set<number>];
+  private plans: [TeamPlan, TeamPlan];
+  private seen: [Set<string>, Set<string>] = [new Set(), new Set()];
+  private blockersCache: Set<number> | null = null;
 
   constructor(readonly map: GameMap, plans: [TeamPlan, TeamPlan], seed: number) {
     this.rng = new Rng(seed);
+    this.plans = plans;
     this.bases = [0, 1].map((t) => ({
       team: t as Team, x: map.bases[t].x, y: map.bases[t].y, hp: RULES.baseHp, maxHp: RULES.baseHp,
     })) as [Base, Base];
-    this.blocked = [ownBlocked(plans[0].defenses), ownBlocked(plans[1].defenses)];
 
     for (const team of [0, 1] as Team[]) {
       plans[team].defenses.forEach((d, i) => {
@@ -105,15 +125,16 @@ export class Sim {
       });
       plans[team].units.forEach((p, i) => {
         const st = UNITS[p.type];
-        const path = expandPlan(map, p.spawn, p.waypoints, this.blocked[team]);
+        const path = expandPlan(map, p.spawn, p.waypoints, ownBlocked(plans[team].defenses, st.move), st.move);
         const x = p.spawn.x + 0.5, y = p.spawn.y + 0.5;
         this.units.push({
-          id: p.id, num: i + 1, team, type: p.type, x, y, px: x, py: y, hp: st.hp, maxHp: st.hp,
-          state: path.length ? 'moving' : 'done', path, pi: 0, cooldown: 0, spawn: p.spawn,
-          revealUntil: -1, facing: team === 0 ? 0 : Math.PI,
+          id: p.id, num: i + 1, team, type: p.type, cls: st.move, x, y, px: x, py: y, hp: st.hp, maxHp: st.hp,
+          state: path.length ? 'moving' : 'done', holdCode: null, path, pi: 0, cooldown: 0, spawn: p.spawn,
+          revealUntil: -1, suppressedUntil: -1, facing: team === 0 ? 0 : Math.PI, engaged: false,
         });
       });
     }
+    this.seen = [this.visibleTo(0), this.visibleTo(1)];
   }
 
   get elapsed() { return this.tick * DT; }
@@ -123,10 +144,13 @@ export class Sim {
     return this.units.filter((u) => u.state !== 'dead' && (team === undefined || u.team === team));
   }
 
+  isSuppressed(u: Unit) { return u.suppressedUntil > this.tick; }
+
   losBlockers(): Set<number> {
+    if (this.blockersCache) return this.blockersCache;
     const s = new Set<number>();
     for (const d of this.defenses) if (d.alive && DEFENSES[d.type].blocksLos) s.add(key(d.x, d.y));
-    return s;
+    return (this.blockersCache = s);
   }
 
   /** Base is attackable only when nobody from its team (unit or turret) is guarding it. */
@@ -140,7 +164,11 @@ export class Sim {
     return false;
   }
 
-  /** What `team` can currently see of the enemy: unit ids and defense ids. Mines are never revealed. */
+  /**
+   * What `team` can currently see of the enemy (unit and defense ids). Spotting is shared:
+   * anything one of your units sees, all of them can shoot at. Units in forest or buildings
+   * are only spotted up close unless they've just fired. Mines are never revealed.
+   */
   visibleTo(team: Team): Set<string> {
     const seen = new Set<string>();
     const blockers = this.losBlockers();
@@ -149,56 +177,87 @@ export class Sim {
     for (const d of this.defenses) if (d.team === team && d.alive && d.type === 'turret') observers.push({ x: d.x + 0.5, y: d.y + 0.5, v: DEFENSES.turret.vision });
     const b = this.bases[team];
     observers.push({ x: b.x, y: b.y, v: 3.5 });
-    const sees = (x: number, y: number) =>
-      observers.some((o) => (o.x - x) ** 2 + (o.y - y) ** 2 <= o.v * o.v && hasLos(this.map, o.x, o.y, x, y, blockers));
+    const sees = (x: number, y: number, hidden: boolean) =>
+      observers.some((o) => {
+        const r = hidden ? Math.min(o.v, RULES.concealRange) : o.v;
+        return (o.x - x) ** 2 + (o.y - y) ** 2 <= r * r && hasLos(this.map, o.x, o.y, x, y, blockers);
+      });
     for (const u of this.units) {
       if (u.team === team || u.state === 'dead') continue;
-      if (u.revealUntil >= this.tick || sees(u.x, u.y)) seen.add(u.id);
+      const hidden = conceals(tileAt(this.map, Math.floor(u.x), Math.floor(u.y)));
+      if (u.revealUntil >= this.tick || sees(u.x, u.y, hidden)) seen.add(u.id);
     }
     for (const d of this.defenses) {
       if (d.team === team || !d.alive || d.type === 'mine') continue;
-      if (sees(d.x + 0.5, d.y + 0.5)) seen.add(d.id);
+      if (sees(d.x + 0.5, d.y + 0.5, false)) seen.add(d.id);
     }
     return seen;
   }
 
-  private enemyStructureAt(team: Team, x: number, y: number): Defense | undefined {
-    return this.defenses.find((d) => d.alive && d.team !== team && d.x === x && d.y === y && DEFENSES[d.type].blocksMove);
+  private enemyStructureAt(u: Unit, x: number, y: number): Defense | undefined {
+    return this.defenses.find((d) => {
+      if (!d.alive || d.team === u.team || d.x !== x || d.y !== y) return false;
+      const st = DEFENSES[d.type];
+      return u.cls === 'foot' ? st.blocksFoot : st.blocksVehicle;
+    });
+  }
+
+  private release(u: Unit) {
+    if (u.state !== 'holding') return;
+    u.state = 'moving';
+    u.holdCode = null;
   }
 
   private apply(cmd: Command) {
+    if (cmd.kind === 'code') {
+      if (this.fired[cmd.team].has(cmd.code)) return;
+      this.fired[cmd.team].add(cmd.code);
+      this.events.push({ kind: 'code', team: cmd.team, code: cmd.code });
+      for (const u of this.units) if (u.team === cmd.team && u.state === 'holding' && u.holdCode === cmd.code) this.release(u);
+      return;
+    }
     const u = this.units.find((v) => v.id === cmd.unitId && v.team === cmd.team);
     if (!u) return;
-    if (cmd.kind === 'go' && u.state === 'holding') u.state = 'moving';
+    if (cmd.kind === 'go') this.release(u);
     if (cmd.kind === 'recall' && (u.state === 'moving' || u.state === 'holding' || u.state === 'done')) {
       const from = { x: Math.floor(u.x), y: Math.floor(u.y) };
-      const homePath = findPath(this.map, from, u.spawn, this.blocked[u.team]) ?? [];
-      u.path = homePath.map((p) => ({ ...p, bp: false }));
+      const homePath = findPath(this.map, from, u.spawn, ownBlocked(this.plans[u.team].defenses, u.cls), u.cls) ?? [];
+      u.path = homePath.map((p) => ({ ...p, bp: null }));
       u.pi = 0;
+      u.holdCode = null;
       u.state = u.path.length ? 'recalling' : 'home';
     }
   }
 
+  /**
+   * Pick the target this unit is best equipped to hurt: effectiveness (damage multiplier vs the
+   * target's armor) over distance. A rocketeer prefers the tank; a rifleman prefers the soldier next to it.
+   */
   private pickTarget(u: Unit, blockers: Set<number>): Target | null {
     const st = UNITS[u.type];
     const r2 = st.range * st.range;
+    const seen = this.seen[u.team];
+    const eff = DAMAGE[st.dtype];
     let best: Target | null = null;
-    let bestD = Infinity;
+    let bestScore = 0;
     for (const e of this.units) {
-      if (e.team === u.team || e.state === 'dead') continue;
-      const d = (e.x - u.x) ** 2 + (e.y - u.y) ** 2;
-      if (d <= r2 && d < bestD && hasLos(this.map, u.x, u.y, e.x, e.y, blockers)) { best = { kind: 'unit', u: e }; bestD = d; }
+      if (e.team === u.team || e.state === 'dead' || !seen.has(e.id)) continue;
+      const d2 = (e.x - u.x) ** 2 + (e.y - u.y) ** 2;
+      if (d2 > r2) continue;
+      const score = eff[UNITS[e.type].armor] / (Math.sqrt(d2) + 2);
+      if (score > bestScore && hasLos(this.map, u.x, u.y, e.x, e.y, blockers)) { best = { kind: 'unit', u: e }; bestScore = score; }
     }
-    if (best) return best;
     for (const d of this.defenses) {
-      if (d.team === u.team || !d.alive || d.type !== 'turret') continue;
-      const dd = (d.x + 0.5 - u.x) ** 2 + (d.y + 0.5 - u.y) ** 2;
-      if (dd <= r2 && dd < bestD && hasLos(this.map, u.x, u.y, d.x + 0.5, d.y + 0.5, blockers)) { best = { kind: 'def', d }; bestD = dd; }
+      if (d.team === u.team || !d.alive || d.type !== 'turret' || !seen.has(d.id)) continue;
+      const d2 = (d.x + 0.5 - u.x) ** 2 + (d.y + 0.5 - u.y) ** 2;
+      if (d2 > r2) continue;
+      const score = eff.structure / (Math.sqrt(d2) + 2);
+      if (score > bestScore && hasLos(this.map, u.x, u.y, d.x + 0.5, d.y + 0.5, blockers)) { best = { kind: 'def', d }; bestScore = score; }
     }
     if (best) return best;
     const next = u.path[u.pi];
     if (next && (u.state === 'moving' || u.state === 'recalling')) {
-      const wall = this.enemyStructureAt(u.team, next.x, next.y);
+      const wall = this.enemyStructureAt(u, next.x, next.y);
       if (wall) return { kind: 'def', d: wall };
     }
     const eb = this.bases[other(u.team)];
@@ -207,28 +266,54 @@ export class Sim {
     return null;
   }
 
-  private fire(team: Team, shooterId: string, fx: number, fy: number, range: number, damage: number, acc: number, structMult: number, t: Target, blockers: Set<number>) {
-    const tx = t.kind === 'unit' ? t.u.x : t.kind === 'def' ? t.d.x + 0.5 : t.b.x;
-    const ty = t.kind === 'unit' ? t.u.y : t.kind === 'def' ? t.d.y + 0.5 : t.b.y;
-    const dist = Math.hypot(tx - fx, ty - fy);
-    const hit = this.rng.next() < acc * (1 - 0.35 * Math.min(1, dist / Math.max(range, 1)));
-    // Misses land near the target so tracers read correctly.
-    const jx = hit ? 0 : (this.rng.next() - 0.5) * 0.9, jy = hit ? 0 : (this.rng.next() - 0.5) * 0.9;
+  /** Apply damage of a type to a unit, accounting for armor class, garrison and cover. */
+  private hurtUnit(t: Unit, raw: number, dtype: DamageType, by: Team, fx: number, fy: number, blockers: Set<number>) {
+    const armor = UNITS[t.type].armor;
+    let dmg = raw * DAMAGE[dtype][armor];
+    if (armor === 'infantry') {
+      const tile = tileAt(this.map, Math.floor(t.x), Math.floor(t.y));
+      let mult = 1;
+      if (garrisoned(tile)) mult = GARRISON[dtype];
+      if ((dtype === 'bullet' || dtype === 'precision') && inCover(this.map, t.x, t.y, fx, fy, blockers)) mult = Math.min(mult, 1 - RULES.coverReduction);
+      dmg *= mult;
+    }
+    t.hp -= dmg;
+    if (t.hp <= 0 && t.state !== 'dead') this.kill(t, by);
+  }
+
+  private fire(team: Team, shooterId: string, fx: number, fy: number, range: number, damage: number, acc: number,
+    dtype: DamageType, t: Target, blockers: Set<number>, opts: { splash?: number; suppress?: number; accVs?: Partial<Record<ArmorClass, number>> } = {}) {
     this.lastAction = this.tick;
-    this.events.push({ kind: 'shot', team, shooter: shooterId, fx, fy, tx: tx + jx, ty: ty + jy, hit, heavy: damage >= 30 });
-    if (!hit) return;
-    if (t.kind === 'unit') {
-      const cover = inCover(this.map, t.u.x, t.u.y, fx, fy, blockers);
-      t.u.hp -= damage * (cover ? 1 - RULES.coverReduction : 1);
-      if (t.u.hp <= 0 && t.u.state !== 'dead') this.kill(t.u, team);
-    } else if (t.kind === 'def') {
-      t.d.hp -= damage * structMult;
-      if (t.d.hp <= 0 && t.d.alive) {
-        t.d.alive = false;
-        this.events.push({ kind: 'wreck', team: t.d.team, id: t.d.id, x: t.d.x + 0.5, y: t.d.y + 0.5 });
+    const tp = posOf(t);
+    const dist = Math.hypot(tp.x - fx, tp.y - fy);
+    const accMult = opts.accVs?.[armorOf(t)] ?? 1;
+    const hit = this.rng.next() < acc * accMult * (1 - 0.35 * Math.min(1, dist / Math.max(range, 1)));
+    const spread = dtype === 'he' ? 1.4 : 0.9;
+    const jx = hit ? 0 : (this.rng.next() - 0.5) * spread, jy = hit ? 0 : (this.rng.next() - 0.5) * spread;
+    const ix = tp.x + jx, iy = tp.y + jy;
+    this.events.push({ kind: 'shot', team, shooter: shooterId, fx, fy, tx: ix, ty: iy, hit, dtype });
+    if (hit) {
+      if (t.kind === 'unit') {
+        this.hurtUnit(t.u, damage, dtype, team, fx, fy, blockers);
+        if (opts.suppress && UNITS[t.u.type].armor === 'infantry') t.u.suppressedUntil = this.tick + opts.suppress * RULES.tickRate;
+      } else if (t.kind === 'def') {
+        t.d.hp -= damage * DAMAGE[dtype].structure;
+        if (t.d.hp <= 0 && t.d.alive) {
+          t.d.alive = false;
+          this.blockersCache = null;
+          this.events.push({ kind: 'wreck', team: t.d.team, id: t.d.id, x: t.d.x + 0.5, y: t.d.y + 0.5 });
+        }
+      } else {
+        t.b.hp = Math.max(0, t.b.hp - damage * DAMAGE[dtype].structure);
       }
-    } else {
-      t.b.hp = Math.max(0, t.b.hp - damage * structMult);
+    }
+    // High explosive splashes whether or not it hit: half damage to every other enemy nearby.
+    if (opts.splash) {
+      this.events.push({ kind: 'boom', team, x: ix, y: iy, r: opts.splash });
+      for (const e of this.units) {
+        if (e.team === team || e.state === 'dead' || (t.kind === 'unit' && hit && e === t.u)) continue;
+        if (Math.hypot(e.x - ix, e.y - iy) <= opts.splash) this.hurtUnit(e, damage * 0.5, dtype, team, ix, iy, blockers);
+      }
     }
   }
 
@@ -240,17 +325,23 @@ export class Sim {
   }
 
   private move(u: Unit) {
-    let budget = UNITS[u.type].speed * DT * (tileAt(this.map, Math.floor(u.x), Math.floor(u.y)) === 'rough' ? 0.55 : 1);
+    const tile = tileAt(this.map, Math.floor(u.x), Math.floor(u.y));
+    let budget = UNITS[u.type].speed * DT * speedMult(tile, u.cls) * (this.isSuppressed(u) ? RULES.suppressedSpeed : 1);
     while (budget > 0 && u.pi < u.path.length) {
       const n = u.path[u.pi];
-      if (this.enemyStructureAt(u.team, n.x, n.y)) return; // breach it first
+      if (this.enemyStructureAt(u, n.x, n.y)) return; // breach it first
       const tx = n.x + 0.5, ty = n.y + 0.5;
       const dx = tx - u.x, dy = ty - u.y;
       const d = Math.hypot(dx, dy);
       if (d > 1e-6) u.facing = Math.atan2(dy, dx);
       if (d <= budget) {
         u.x = tx; u.y = ty; budget -= d; u.pi++;
-        if (n.bp && u.state === 'moving') { u.state = 'holding'; return; }
+        // A breakpoint whose code was already called is open: keep going.
+        if (n.bp && u.state === 'moving' && !this.fired[u.team].has(n.bp)) {
+          u.state = 'holding';
+          u.holdCode = n.bp;
+          return;
+        }
       } else {
         u.x += (dx / d) * budget; u.y += (dy / d) * budget; budget = 0;
       }
@@ -261,8 +352,10 @@ export class Sim {
   step(commands: Command[] = []) {
     if (this.result) return;
     this.events = [];
+    this.blockersCache = null;
     for (const c of commands) this.apply(c);
     for (const u of this.units) { u.px = u.x; u.py = u.y; }
+    this.seen = [this.visibleTo(0), this.visibleTo(1)];
 
     // Mines
     for (const m of this.defenses) {
@@ -271,11 +364,12 @@ export class Sim {
       const triggered = this.units.some((u) => u.team !== m.team && u.state !== 'dead' && Math.hypot(u.x - mx, u.y - my) <= DEFENSES.mine.range);
       if (!triggered) continue;
       m.alive = false;
-      this.events.push({ kind: 'boom', team: m.team, x: mx, y: my });
+      this.lastAction = this.tick;
+      this.events.push({ kind: 'boom', team: m.team, x: mx, y: my, r: RULES.mineBlastRadius });
       for (const u of this.units) {
         if (u.team === m.team || u.state === 'dead') continue;
         if (Math.hypot(u.x - mx, u.y - my) <= RULES.mineBlastRadius) {
-          u.hp -= DEFENSES.mine.damage;
+          u.hp -= DEFENSES.mine.damage * DAMAGE.blast[UNITS[u.type].armor];
           if (u.hp <= 0) this.kill(u, m.team);
         }
       }
@@ -283,20 +377,24 @@ export class Sim {
 
     const blockers = this.losBlockers();
 
-    // Units: shoot, then move if free to
+    // Units: heal, shoot, then move if free to
     for (const u of this.units) {
       if (u.state === 'dead') continue;
       const st = UNITS[u.type];
+      if (st.heal) this.heal(u, st.heal);
       u.cooldown -= DT;
       const t = this.pickTarget(u, blockers);
+      u.engaged = !!t;
       if (t) {
-        const tx = t.kind === 'unit' ? t.u.x : t.kind === 'def' ? t.d.x + 0.5 : t.b.x;
-        const ty = t.kind === 'unit' ? t.u.y : t.kind === 'def' ? t.d.y + 0.5 : t.b.y;
-        u.facing = Math.atan2(ty - u.y, tx - u.x);
+        const tp = posOf(t);
+        u.facing = Math.atan2(tp.y - u.y, tp.x - u.x);
         if (u.cooldown <= 0) {
           u.cooldown = st.cooldown;
           u.revealUntil = this.tick + RULES.tickRate * 1.5;
-          this.fire(u.team, u.id, u.x, u.y, st.range, st.damage, u.state === 'recalling' ? st.accuracy * 0.6 : st.accuracy, st.structureMult, t, blockers);
+          let acc = st.accuracy;
+          if (u.state === 'recalling') acc *= 0.6;
+          if (this.isSuppressed(u)) acc *= RULES.suppressedAccuracy;
+          this.fire(u.team, u.id, u.x, u.y, st.range, st.damage, acc, st.dtype, t, blockers, { splash: st.splash, suppress: st.suppress, accVs: st.accVs });
         }
       }
       // Advancing units stop to fight; retreating units keep running.
@@ -310,20 +408,32 @@ export class Sim {
       d.cooldown -= DT;
       if (d.cooldown > 0) continue;
       const cx = d.x + 0.5, cy = d.y + 0.5;
-      let best: Unit | null = null, bestD = st.range * st.range;
+      let best: Unit | null = null, bestScore = 0;
       for (const e of this.units) {
-        if (e.team === d.team || e.state === 'dead') continue;
-        const dd = (e.x - cx) ** 2 + (e.y - cy) ** 2;
-        if (dd <= bestD && hasLos(this.map, cx, cy, e.x, e.y, blockers)) { best = e; bestD = dd; }
+        if (e.team === d.team || e.state === 'dead' || !this.seen[d.team].has(e.id)) continue;
+        const dist = Math.hypot(e.x - cx, e.y - cy);
+        if (dist > st.range) continue;
+        const score = DAMAGE[st.dtype][UNITS[e.type].armor] / (dist + 2);
+        if (score > bestScore && hasLos(this.map, cx, cy, e.x, e.y, blockers)) { best = e; bestScore = score; }
       }
       if (best) {
         d.cooldown = st.cooldown;
-        this.fire(d.team, d.id, cx, cy, st.range, st.damage, st.accuracy, 1, { kind: 'unit', u: best }, blockers);
+        this.fire(d.team, d.id, cx, cy, st.range, st.damage, st.accuracy, st.dtype, { kind: 'unit', u: best }, blockers);
       }
     }
 
     this.tick++;
     this.checkEnd();
+  }
+
+  private heal(medic: Unit, rate: number) {
+    let best: Unit | null = null;
+    for (const f of this.units) {
+      if (f.team !== medic.team || f.state === 'dead' || f.hp >= f.maxHp || UNITS[f.type].armor !== 'infantry') continue;
+      if (Math.hypot(f.x - medic.x, f.y - medic.y) > 2.5) continue;
+      if (!best || f.hp / f.maxHp < best.hp / best.maxHp) best = f;
+    }
+    if (best) best.hp = Math.min(best.maxHp, best.hp + rate * DT * (best === medic ? 0.5 : 1));
   }
 
   private checkEnd() {
@@ -352,7 +462,10 @@ export class Sim {
     if (winner === undefined) return;
     const carry = (t: Team): UnitPlan[] =>
       this.alive(t).map((u) => ({ id: u.id, type: u.type, spawn: u.spawn, waypoints: [] }));
-    const survivors: [UnitPlan[], UnitPlan[]] = [carry(0), carry(1)];
-    this.result = { winner, reason, kills: [...this.kills] as [number, number], baseDestroyed, survivors, ticks: this.tick };
+    const fielded = (t: Team) => this.units.filter((u) => u.team === t).map((u) => u.type);
+    this.result = {
+      winner, reason, kills: [...this.kills] as [number, number], baseDestroyed,
+      survivors: [carry(0), carry(1)], fielded: [fielded(0), fielded(1)], ticks: this.tick,
+    };
   }
 }
