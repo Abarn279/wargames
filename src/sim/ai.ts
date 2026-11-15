@@ -7,7 +7,9 @@ import type { Match } from './match';
 
 const side = (m: GameMap, team: Team, p: Pt) => (team === 0 ? p : mirrorTile(m, p));
 
-export interface AiPlanResult { plan: TeamPlan; spent: number }
+/** When the AI intends to call each go code (seconds into the round). */
+export interface CodeTiming { code: GoCode; at: number }
+export interface AiPlanResult { plan: TeamPlan; spent: number; schedule: CodeTiming[] }
 
 /** Build the AI's purchases, defenses and unit plans for a round. Reacts to what the enemy fielded last round. */
 export function planAi(m: GameMap, team: Team, match: Match, seed: number): AiPlanResult {
@@ -85,6 +87,10 @@ export function planAi(m: GameMap, team: Team, match: Match, seed: number): AiPl
   }
 
   // --- Roles & routes ---
+  if (m.objectives.length) {
+    const schedule = planObjectiveRoutes(m, team, units, defenses, rng);
+    return { plan: { units, defenses }, spent: econ.money - money, schedule };
+  }
   const vehicleLanes = m.ai.lanes.map((l, i) => (l.vehicle ? i : -1)).filter((i) => i >= 0);
   const hasTank = units.some((u) => u.type === 'tank');
   const laneA = hasTank ? rng.pick(vehicleLanes) : rng.int(0, m.ai.lanes.length - 1);
@@ -119,7 +125,82 @@ export function planAi(m: GameMap, team: Team, match: Match, seed: number): AiPl
     }));
     u.waypoints = wps.filter(reach);
   }
-  return { plan: { units, defenses }, spent: econ.money - money };
+  return { plan: { units, defenses }, spent: econ.money - money, schedule: [] };
+}
+
+/**
+ * Objective play. The windows are public, so the AI plans a timeline:
+ *  - group 1 takes the first objective, sits on it (holding on ALPHA), then rotates to the last one;
+ *  - group 2 stages on its own side of the second objective (BRAVO), moves on just before it opens,
+ *    holds it (CHARLIE), then rotates to the last one;
+ *  - one guard stays home when there are enough units, and sometimes a breacher raids the base.
+ * Returns when to call each code.
+ */
+function planObjectiveRoutes(m: GameMap, team: Team, units: UnitPlan[], defenses: DefensePlan[], rng: Rng): CodeTiming[] {
+  const objs = [...m.objectives].sort((a, b) => a.from - b.from);
+  const first = objs[0], second = objs[1] ?? objs[0], last = objs[objs.length - 1];
+  const home = m.bases[team];
+  const toward = (o: { x: number; y: number }, dist: number) => {
+    const dx = home.x - o.x, dy = home.y - o.y, d = Math.hypot(dx, dy) || 1;
+    return { x: o.x + (dx / d) * dist, y: o.y + (dy / d) * dist };
+  };
+  const at = (o: { x: number; y: number }, cls: 'foot' | 'vehicle', blocked: Set<number>) => nearestWalkable(m, o, blocked, cls);
+  const eta = (from: Pt, to: Pt, type: UnitType, blocked: Set<number>) => {
+    const path = findPath(m, from, to, blocked, UNITS[type].move);
+    return path ? (path.length * 1.15) / UNITS[type].speed : 0;
+  };
+
+  const order = [...units].sort((a, b) => roleRank(a.type) - roleRank(b.type));
+  let guards = units.length >= 4 ? 1 : 0;
+  let raiders = units.length >= 5 && rng.next() < 0.35 ? 1 : 0;
+  // Occasionally concede the first point and stack the second.
+  const skipFirst = objs.length > 2 && rng.next() < 0.25;
+  const attackers: UnitPlan[] = [];
+  for (const u of order) {
+    const cls = UNITS[u.type].move;
+    const blocked = ownBlocked(defenses, cls);
+    if (cls === 'foot' && guards > 0 && (u.type === 'gunner' || u.type === 'rifleman' || u.type === 'medic')) {
+      guards--;
+      u.waypoints = [{ ...at(side(m, team, rng.pick(m.ai.guard)), cls, blocked), code: null }];
+      continue;
+    }
+    if (u.type === 'breacher' && raiders > 0) {
+      raiders--;
+      const lane = rng.pick(m.ai.lanes.filter((l) => l.vehicle || cls === 'foot'));
+      u.waypoints = lane.pts.map((p) => ({ ...at(side(m, team, p), cls, blocked), code: null }))
+        .filter((w) => findPath(m, u.spawn, w, blocked, cls) !== null);
+      continue;
+    }
+    attackers.push(u);
+  }
+
+  let latestStage = 0;
+  attackers.forEach((u, i) => {
+    const cls = UNITS[u.type].move;
+    const blocked = ownBlocked(defenses, cls);
+    const g1 = !skipFirst && (u.type === 'tank' ? true : i % 2 === 0);
+    const finalPt = at(last, cls, blocked);
+    if (g1) {
+      const p1 = at(first, cls, blocked);
+      u.waypoints = [{ ...p1, code: 'A' }, { ...finalPt, code: null }];
+    } else {
+      const stage = at(toward(second, 4.5), cls, blocked);
+      const p2 = at(second, cls, blocked);
+      latestStage = Math.max(latestStage, eta(stage, p2, u.type, blocked));
+      u.waypoints = second === last
+        ? [{ ...stage, code: 'B' }, { ...p2, code: null }]
+        : [{ ...stage, code: 'B' }, { ...p2, code: 'C' }, { ...finalPt, code: null }];
+    }
+    u.waypoints = u.waypoints.filter((w, j, all) =>
+      findPath(m, j === 0 ? u.spawn : all[j - 1], w, blocked, cls) !== null || (j > 0 && w.x === all[j - 1].x && w.y === all[j - 1].y));
+  });
+
+  const jitter = () => (rng.next() - 0.5) * 4;
+  return [
+    { code: 'A', at: Math.max(0, first.to + jitter()) },
+    { code: 'B', at: Math.max(0, second.from - latestStage - 2 + jitter()) },
+    { code: 'C', at: Math.max(0, second.to + jitter()) },
+  ];
 }
 
 function roleRank(t: UnitType) {
@@ -132,7 +213,7 @@ export class AiDirector {
   private patience = new Map<GoCode, number>();
   private lastRecall = -999;
   private rng: Rng;
-  constructor(readonly team: Team, seed: number) {
+  constructor(readonly team: Team, seed: number, private schedule: CodeTiming[] = []) {
     this.rng = new Rng(seed);
   }
 
@@ -144,6 +225,12 @@ export class AiDirector {
 
     for (const code of GO_CODES) {
       if (sim.fired[this.team].has(code)) continue;
+      // Scheduled codes (objective rotations) go on the clock, not on patience.
+      const timed = this.schedule.find((s) => s.code === code);
+      if (timed) {
+        if (sim.elapsed >= timed.at) cmds.push({ team: this.team, kind: 'code', code });
+        continue;
+      }
       // Members: units holding on this code, or still en route to a breakpoint with it.
       const members = mine.filter((u) => u.holdCode === code || (u.state === 'moving' && u.path.slice(u.pi).some((n) => n.bp === code)));
       const holding = members.filter((u) => u.state === 'holding');

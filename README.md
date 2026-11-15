@@ -4,11 +4,39 @@ Single-player, round-based tactical wargame (skirmish vs an AI opponent): **buy 
 
 Each round:
 
-1. **Plan (untimed; hit READY when you're set).** Spend money on units and defenses. Tap a unit, then tap the map to lay waypoints. Tap a waypoint to tag it with a **go code**: ALPHA → BRAVO → CHARLIE → off. A tagged waypoint is a breakpoint, and the unit holds there.
+1. **Plan (untimed; hit READY when you're set).** Spend money on units and defenses. Tap a unit, then tap the map to lay waypoints; each waypoint shows when the unit gets there. Tap a waypoint to tag it with a **go code**: ALPHA → BRAVO → CHARLIE → off. A tagged waypoint is a breakpoint, and the unit holds there.
 2. **Execute (live).** Your plan and the AI's run at the same time. Call **A / B / C** to release everyone holding on that code at once. That's how you sync a tank push over the bridge with infantry wading the ford. Tap a single unit's card to release just that unit. A code called early stays open, so units arriving later walk straight through.
-3. **Audible.** **⟲ RECALL** sends a unit back to its spawn. It stays home for the rest of the round and still defends. If everyone on both sides ends up home, the round is a draw.
+3. **Audible.** **⟲ RECALL** sends a unit back to its spawn. It stays home for the rest of the round and still defends.
 
-**Win a round** by eliminating the enemy team, or by destroying their base. The base can only be damaged when no enemy unit or turret is inside its guard ring.
+## Objectives: why you move
+
+Each map has **objectives that go live on a published schedule**. The strip along the top of the map shows the schedule. On Riverside:
+
+| Objective | Live |
+|---|---|
+| North bridge | 0:15 – 0:45 |
+| South bridge | 0:45 – 1:15 |
+| Ford | 1:15 – 1:55 |
+
+Every second a team holds a live objective **uncontested** (its units inside the ring, no enemy units) is a point. **When time runs out, most points wins the round.** Eliminating the enemy or destroying an unguarded base still wins outright. If nothing can move or shoot any more, the round ends early and every unfinished window goes to whoever is sitting on it.
+
+A plan is therefore a timeline: take the first bridge, rotate on ALPHA when it closes, stage for the ford on BRAVO. Both sides know where the other has to be and when, and that's where ambushes come from. The two bridges mirror each other, and each side has a building overlooking one of them.
+
+## Movement and overwatch: how you move
+
+- **Moving is exposed.** A unit that moved in the last 0.6s gets no cover or building protection and shoots at 75% accuracy.
+- **Overwatch.** A unit that has been still for 1s and quiet for 3s is on overwatch (white sight arc). When it opens fire, its first 1.5s are aimed fire: much more accurate, no range falloff, and +50% damage. Walking into a settled unit is how you lose a fight.
+- **Covering fire.** Units prioritize any enemy that just shot at a teammate. So a unit set up on overwatch protects a moving one: the ambusher gives itself away by firing and eats the aimed burst.
+- **Suppression** (gunner fire) knocks units off overwatch and cancels their aimed fire.
+
+Measured in `tests/tactics.test.ts`:
+
+| Scenario | Win rate |
+|---|---|
+| Settled rifleman vs one walking into it | 87% (60% without these rules) |
+| Rifleman walking past a hidden ambusher, alone | 10% |
+| Same, with a sniper covering from overwatch | 97% |
+| One settled rifleman vs two walking in | under 60% (numbers still matter) |
 
 **Economy.** Win/draw/loss income, a loss-streak bonus, kill rewards, and a base-kill bonus. Unspent money rolls over, and surviving units carry into the next round. First to 5 rounds wins.
 

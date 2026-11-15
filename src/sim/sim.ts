@@ -2,7 +2,7 @@ import {
   DAMAGE, DEFENSES, GARRISON, RULES, UNITS, other,
   type ArmorClass, type DamageType, type DefenseType, type GoCode, type MoveClass, type Team, type UnitType,
 } from './config';
-import { type GameMap, type Pt, conceals, garrisoned, key, speedMult, tileAt } from './map';
+import { type GameMap, type Objective, type Pt, conceals, garrisoned, key, speedMult, tileAt } from './map';
 import { expandPlan, findPath, type PathNode, type Waypoint } from './path';
 import { hasLos, inCover } from './los';
 import { Rng } from './rng';
@@ -51,6 +51,9 @@ export interface Unit {
   suppressedUntil: number;
   facing: number;
   engaged: boolean; // had a target this tick
+  movedTick: number; // last tick this unit changed position
+  shotTick: number; // last tick this unit fired
+  ambushUntil: number; // tick until which this unit's opening burst gets the overwatch bonus
 }
 
 export interface Defense {
@@ -74,7 +77,8 @@ export type SimEvent =
   | { kind: 'boom'; team: Team; x: number; y: number; r: number }
   | { kind: 'death'; team: Team; id: string; x: number; y: number }
   | { kind: 'wreck'; team: Team; id: string; x: number; y: number }
-  | { kind: 'code'; team: Team; code: GoCode };
+  | { kind: 'code'; team: Team; code: GoCode }
+  | { kind: 'objective'; id: string; phase: 'live' | 'closed'; holder: Team | null };
 
 export interface RoundResult {
   winner: Team | null;
@@ -84,6 +88,8 @@ export interface RoundResult {
   survivors: [UnitPlan[], UnitPlan[]];
   fielded: [UnitType[], UnitType[]];
   ticks: number;
+  /** Objective points (seconds held) per team. */
+  score: [number, number];
 }
 
 type Target =
@@ -106,6 +112,10 @@ export class Sim {
   result: RoundResult | null = null;
   private kills: [number, number] = [0, 0];
   private lastAction = 0;
+  /** Objective points: seconds each team has held a live objective uncontested. */
+  score: [number, number] = [0, 0];
+  /** Enemy units that recently shot at each team (id -> tick), so covering units prioritize them. */
+  private threats: [Map<string, number>, Map<string, number>] = [new Map(), new Map()];
   private rng: Rng;
   private plans: [TeamPlan, TeamPlan];
   private seen: [Set<string>, Set<string>] = [new Set(), new Set()];
@@ -131,6 +141,7 @@ export class Sim {
           id: p.id, num: i + 1, team, type: p.type, cls: st.move, x, y, px: x, py: y, hp: st.hp, maxHp: st.hp,
           state: path.length ? 'moving' : 'done', holdCode: null, path, pi: 0, cooldown: 0, spawn: p.spawn,
           revealUntil: -1, suppressedUntil: -1, facing: team === 0 ? 0 : Math.PI, engaged: false,
+          movedTick: -1000, shotTick: -1000, ambushUntil: -1,
         });
       });
     }
@@ -145,6 +156,32 @@ export class Sim {
   }
 
   isSuppressed(u: Unit) { return u.suppressedUntil > this.tick; }
+
+  /** Moved within the last moment: no cover or garrison protection, and shaky aim. */
+  isExposed(u: Unit) { return this.tick - u.movedTick < RULES.exposedSeconds * RULES.tickRate; }
+
+  /** Settled, quiet and not pinned: the next shot is an aimed ambush shot. */
+  isOverwatching(u: Unit) {
+    const tr = RULES.tickRate;
+    return u.state !== 'dead' && !this.isSuppressed(u) &&
+      this.tick - u.movedTick >= RULES.overwatchSettleSeconds * tr &&
+      this.tick - u.shotTick >= RULES.overwatchQuietSeconds * tr;
+  }
+
+  objectivePhase(o: Objective): 'pending' | 'live' | 'closed' {
+    const t = this.elapsed;
+    return t < o.from ? 'pending' : t < o.to ? 'live' : 'closed';
+  }
+
+  /** Who holds an objective right now: a team, 'contested', or null if nobody is on it. */
+  objectiveHolder(o: Objective): Team | 'contested' | null {
+    let here0 = false, here1 = false;
+    for (const u of this.units) {
+      if (u.state === 'dead' || Math.hypot(u.x - o.x, u.y - o.y) > o.r) continue;
+      if (u.team === 0) here0 = true; else here1 = true;
+    }
+    return here0 && here1 ? 'contested' : here0 ? 0 : here1 ? 1 : null;
+  }
 
   losBlockers(): Set<number> {
     if (this.blockersCache) return this.blockersCache;
@@ -244,7 +281,9 @@ export class Sim {
       if (e.team === u.team || e.state === 'dead' || !seen.has(e.id)) continue;
       const d2 = (e.x - u.x) ** 2 + (e.y - u.y) ** 2;
       if (d2 > r2) continue;
-      const score = eff[UNITS[e.type].armor] / (Math.sqrt(d2) + 2);
+      // Covering fire: an enemy that just shot at one of ours jumps to the top of the list.
+      const threat = this.tick - (this.threats[u.team].get(e.id) ?? -1e9) <= RULES.tickRate * 2 ? RULES.coverFirePriority : 1;
+      const score = threat * eff[UNITS[e.type].armor] / (Math.sqrt(d2) + 2);
       if (score > bestScore && hasLos(this.map, u.x, u.y, e.x, e.y, blockers)) { best = { kind: 'unit', u: e }; bestScore = score; }
     }
     for (const d of this.defenses) {
@@ -270,7 +309,7 @@ export class Sim {
   private hurtUnit(t: Unit, raw: number, dtype: DamageType, by: Team, fx: number, fy: number, blockers: Set<number>) {
     const armor = UNITS[t.type].armor;
     let dmg = raw * DAMAGE[dtype][armor];
-    if (armor === 'infantry') {
+    if (armor === 'infantry' && !this.isExposed(t)) {
       const tile = tileAt(this.map, Math.floor(t.x), Math.floor(t.y));
       let mult = 1;
       if (garrisoned(tile)) mult = GARRISON[dtype];
@@ -282,16 +321,19 @@ export class Sim {
   }
 
   private fire(team: Team, shooterId: string, fx: number, fy: number, range: number, damage: number, acc: number,
-    dtype: DamageType, t: Target, blockers: Set<number>, opts: { splash?: number; suppress?: number; accVs?: Partial<Record<ArmorClass, number>> } = {}) {
+    dtype: DamageType, t: Target, blockers: Set<number>, opts: { splash?: number; suppress?: number; accVs?: Partial<Record<ArmorClass, number>>; aimed?: boolean } = {}) {
     this.lastAction = this.tick;
     const tp = posOf(t);
     const dist = Math.hypot(tp.x - fx, tp.y - fy);
     const accMult = opts.accVs?.[armorOf(t)] ?? 1;
-    const hit = this.rng.next() < acc * accMult * (1 - 0.35 * Math.min(1, dist / Math.max(range, 1)));
+    // Aimed (overwatch) fire down a prepared line doesn't fall off with range.
+    const falloff = opts.aimed ? 1 : 1 - 0.35 * Math.min(1, dist / Math.max(range, 1));
+    const hit = this.rng.next() < acc * accMult * falloff;
     const spread = dtype === 'he' ? 1.4 : 0.9;
     const jx = hit ? 0 : (this.rng.next() - 0.5) * spread, jy = hit ? 0 : (this.rng.next() - 0.5) * spread;
     const ix = tp.x + jx, iy = tp.y + jy;
     this.events.push({ kind: 'shot', team, shooter: shooterId, fx, fy, tx: ix, ty: iy, hit, dtype });
+    if (t.kind === 'unit') this.threats[t.u.team].set(shooterId, this.tick);
     if (hit) {
       if (t.kind === 'unit') {
         this.hurtUnit(t.u, damage, dtype, team, fx, fy, blockers);
@@ -336,6 +378,7 @@ export class Sim {
       if (d > 1e-6) u.facing = Math.atan2(dy, dx);
       if (d <= budget) {
         u.x = tx; u.y = ty; budget -= d; u.pi++;
+        u.movedTick = this.tick;
         // A breakpoint whose code was already called is open: keep going.
         if (n.bp && u.state === 'moving' && !this.fired[u.team].has(n.bp)) {
           u.state = 'holding';
@@ -344,6 +387,7 @@ export class Sim {
         }
       } else {
         u.x += (dx / d) * budget; u.y += (dy / d) * budget; budget = 0;
+        u.movedTick = this.tick;
       }
     }
     if (u.pi >= u.path.length) u.state = u.state === 'recalling' ? 'home' : 'done';
@@ -392,9 +436,22 @@ export class Sim {
           u.cooldown = st.cooldown;
           u.revealUntil = this.tick + RULES.tickRate * 1.5;
           let acc = st.accuracy;
+          let dmg = st.damage;
+          let aimed = false;
           if (u.state === 'recalling') acc *= 0.6;
           if (this.isSuppressed(u)) acc *= RULES.suppressedAccuracy;
-          this.fire(u.team, u.id, u.x, u.y, st.range, st.damage, acc, st.dtype, t, blockers, { splash: st.splash, suppress: st.suppress, accVs: st.accVs });
+          if (this.isExposed(u)) acc *= RULES.exposedAccuracy;
+          else {
+            // Springing an ambush: the opening burst from a settled, quiet unit is aimed fire.
+            if (this.isOverwatching(u)) u.ambushUntil = this.tick + RULES.ambushBurstSeconds * RULES.tickRate;
+            if (this.tick < u.ambushUntil && !this.isSuppressed(u)) {
+              acc = Math.min(0.95, acc * RULES.overwatchAccuracy);
+              dmg *= RULES.overwatchDamage;
+              aimed = true;
+            }
+          }
+          u.shotTick = this.tick;
+          this.fire(u.team, u.id, u.x, u.y, st.range, dmg, acc, st.dtype, t, blockers, { splash: st.splash, suppress: st.suppress, accVs: st.accVs, aimed });
         }
       }
       // Advancing units stop to fight; retreating units keep running.
@@ -422,8 +479,38 @@ export class Sim {
       }
     }
 
+    this.scoreObjectives();
     this.tick++;
     this.checkEnd();
+  }
+
+  private scoreObjectives() {
+    const tr = RULES.tickRate;
+    for (const o of this.map.objectives) {
+      if (this.tick === Math.round(o.from * tr)) this.events.push({ kind: 'objective', id: o.id, phase: 'live', holder: null });
+      if (this.tick === Math.round(o.to * tr)) {
+        const h = this.objectiveHolder(o);
+        this.events.push({ kind: 'objective', id: o.id, phase: 'closed', holder: h === 'contested' ? null : h });
+      }
+      if (this.objectivePhase(o) !== 'live') continue;
+      const h = this.objectiveHolder(o);
+      if (h === 0 || h === 1) this.score[h] += DT;
+    }
+  }
+
+  /**
+   * Final objective score if nothing moves or fires again: every unfinished window goes to
+   * whoever is sitting on it now. Used to end frozen rounds early without changing the result.
+   */
+  projectedScore(): [number, number] {
+    const s: [number, number] = [this.score[0], this.score[1]];
+    const t = this.elapsed;
+    for (const o of this.map.objectives) {
+      if (o.to <= t) continue;
+      const h = this.objectiveHolder(o);
+      if (h === 0 || h === 1) s[h] += o.to - Math.max(o.from, t);
+    }
+    return s;
   }
 
   private heal(medic: Unit, rate: number) {
@@ -448,16 +535,15 @@ export class Sim {
     } else if (!a0.length || !a1.length) {
       if (!a0.length && !a1.length) { winner = null; reason = 'Mutual elimination'; }
       else { winner = a0.length ? 0 : 1; reason = 'Enemy team eliminated'; }
-    } else if ([...a0, ...a1].every((u) => u.state === 'home')) {
-      winner = null; reason = 'Everyone pulled back';
     } else if (
       [...a0, ...a1].every((u) => u.state === 'home' || u.state === 'done') &&
-      this.tick - this.lastAction > RULES.tickRate * RULES.stalemateSeconds
+      ([...a0, ...a1].every((u) => u.state === 'home') || this.tick - this.lastAction > RULES.tickRate * RULES.stalemateSeconds)
     ) {
-      // Nobody can advance any more and nobody is shooting: no point running out the clock.
-      winner = null; reason = 'Stalemate';
+      // Nobody can advance any more and nobody is shooting: the rest of the round is already decided.
+      this.score = this.projectedScore();
+      [winner, reason] = this.decideOnPoints('Positions locked');
     } else if (this.timeLeft <= 0) {
-      winner = null; reason = 'Time expired';
+      [winner, reason] = this.decideOnPoints('Time');
     }
     if (winner === undefined) return;
     const carry = (t: Team): UnitPlan[] =>
@@ -466,6 +552,14 @@ export class Sim {
     this.result = {
       winner, reason, kills: [...this.kills] as [number, number], baseDestroyed,
       survivors: [carry(0), carry(1)], fielded: [fielded(0), fielded(1)], ticks: this.tick,
+      score: [Math.round(this.score[0]), Math.round(this.score[1])],
     };
+  }
+
+  private decideOnPoints(prefix: string): [Team | null, string] {
+    if (!this.map.objectives.length) return [null, `${prefix}: draw`];
+    const [s0, s1] = this.score.map(Math.round);
+    if (s0 === s1) return [null, `${prefix}: objectives tied ${s0}–${s1}`];
+    return [s0 > s1 ? 0 : 1, `${prefix}: objectives ${s0}–${s1}`];
   }
 }

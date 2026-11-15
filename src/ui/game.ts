@@ -1,10 +1,10 @@
 import { CODE_NAMES, DEFENSES, GO_CODES, RULES, UNITS, type DamageType, type DefenseType, type GoCode, type Team, type UnitType } from '../sim/config';
-import { MAPS, MAP_ORDER, canDeployUnit, canFortify, key, nearestWalkable, tileAt, type Pt } from '../sim/map';
+import { MAPS, MAP_ORDER, canDeployUnit, canFortify, key, nearestWalkable, speedMult, tileAt, type Pt } from '../sim/map';
 import { expandPlan, findPath, type PathNode, type Waypoint } from '../sim/path';
 import { hasLos } from '../sim/los';
 import { Sim, ownBlocked, type Command, type DefensePlan, type TeamPlan, type Unit } from '../sim/sim';
 import { Match, type RoundSummary } from '../sim/match';
-import { AiDirector, planAi } from '../sim/ai';
+import { AiDirector, planAi, type CodeTiming } from '../sim/ai';
 import { C, bar, fitText, fmtTime, inRect, roundRect, text, type Rect } from './draw';
 
 type Phase = 'title' | 'plan' | 'live' | 'roundEnd' | 'matchEnd';
@@ -75,6 +75,7 @@ export class Game {
   private selected: Selection | null = null;
   private lastWaypoints = new Map<string, Waypoint[]>();
   private aiPlan: TeamPlan = { units: [], defenses: [] };
+  private aiSchedule: CodeTiming[] = [];
   private pathCache = new Map<string, PathNode[]>();
 
   // live
@@ -172,6 +173,7 @@ export class Game {
     this.selected = null;
     const ai = planAi(this.map, ENEMY, this.match, this.seed + this.match.round * 7919);
     this.aiPlan = ai.plan;
+    this.aiSchedule = ai.schedule;
     this.match.teams[ENEMY].money -= ai.spent;
     if (this.units.length) this.flash(`${this.units.length} veteran${this.units.length > 1 ? 's' : ''} carried over. Re-plan or keep last route.`);
     else this.flash('Buy units, then tap a unit and tap the map to route it.');
@@ -187,7 +189,7 @@ export class Game {
     };
     const seed = this.seed ^ (this.match.round * 2654435761);
     this.sim = new Sim(this.map, [plan, this.aiPlan], seed);
-    this.ai = new AiDirector(ENEMY, seed + 1);
+    this.ai = new AiDirector(ENEMY, seed + 1, this.aiSchedule);
     this.pending = [];
     this.acc = 0;
     this.effects = [];
@@ -257,6 +259,10 @@ export class Game {
       } else if (e.kind === 'boom') {
         if (e.team === PLAYER || this.fogAt(e.x, e.y)) this.effects.push({ kind: 'boom', x: e.x, y: e.y, r: e.r, t0: this.now });
         if (e.r > 1.2 && navigator.vibrate) navigator.vibrate(30);
+      } else if (e.kind === 'objective') {
+        const o = this.map.objectives.find((x) => x.id === e.id);
+        if (o && e.phase === 'live') this.flash(`${o.name} is live until ${fmtTime(o.to)}`, C.hold);
+        if (o && e.phase === 'closed') this.flash(`${o.name} closed${e.holder === PLAYER ? ' — you held it' : e.holder === ENEMY ? ' — the AI held it' : ''}`, e.holder === PLAYER ? C.team[0] : e.holder === ENEMY ? C.team[1] : C.dim);
       } else if (e.kind === 'code') {
         if (e.team === PLAYER) this.flash(`${CODE_NAMES[e.code]} — go, go, go`, CODE_COLORS[e.code]);
       } else if (e.kind === 'death') {
@@ -738,11 +744,17 @@ export class Game {
   }
 
   private drawUnitGlyph(x: number, y: number, team: Team, type: UnitType, num: number, facing: number,
-    opts: { hpFrac?: number; ring?: string; alpha?: number; selected?: boolean; suppressed?: boolean; hull?: number; code?: GoCode | null } = {}) {
+    opts: { hpFrac?: number; ring?: string; alpha?: number; selected?: boolean; suppressed?: boolean; hull?: number; code?: GoCode | null; overwatch?: boolean } = {}) {
     const ctx = this.ctx, ts = this.ts;
     const X = this.sx(x), Y = this.sy(y), tank = type === 'tank';
     const r = ts * (tank ? 0.46 : 0.36);
     ctx.globalAlpha = opts.alpha ?? 1;
+    if (opts.overwatch) {
+      // Overwatch: a sight arc in the direction the unit is watching.
+      ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+      ctx.lineWidth = Math.max(1.5, ts * 0.08);
+      ctx.beginPath(); ctx.arc(X, Y, r + ts * 0.32, facing - 0.55, facing + 0.55); ctx.stroke();
+    }
     if (tank) {
       if (opts.selected) { ctx.beginPath(); ctx.arc(X, Y, r + ts * 0.18, 0, Math.PI * 2); ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke(); }
       if (opts.ring) { ctx.beginPath(); ctx.arc(X, Y, r + ts * 0.08, 0, Math.PI * 2); ctx.strokeStyle = opts.ring; ctx.lineWidth = Math.max(2, ts * 0.1); ctx.stroke(); }
@@ -809,7 +821,7 @@ export class Game {
       bar(ctx, { x: X - r, y: Y + r + ts * 0.12, w: r * 2, h: Math.max(2, ts * 0.09) }, opts.hpFrac, opts.hpFrac > 0.35 ? C.ok : C.danger);
   }
 
-  private drawPath(start: Pt, nodes: PathNode[], waypoints: Waypoint[] | null, color: string, emphasis: boolean, fired?: Set<GoCode>) {
+  private drawPath(start: Pt, nodes: PathNode[], waypoints: Waypoint[] | null, color: string, emphasis: boolean, fired?: Set<GoCode>, etas?: string[]) {
     const ctx = this.ctx, ts = this.ts;
     if (!nodes.length) return;
     ctx.strokeStyle = color;
@@ -832,6 +844,17 @@ export class Game {
           ctx.beginPath(); ctx.arc(X, Y, ts * 0.22, 0, Math.PI * 2); ctx.fill();
           text(ctx, String(i + 1), X, Y + 0.5, Math.max(7, ts * 0.28), '#0b0f12', 'center', 800);
         }
+        const eta = etas?.[i];
+        if (eta) {
+          const fs = Math.max(9, ts * 0.5);
+          ctx.font = `700 ${fs}px system-ui`;
+          const tw = ctx.measureText(eta).width + 8;
+          const ly = Y + ts * 0.5;
+          roundRect(ctx, { x: X - tw / 2, y: ly, w: tw, h: fs + 4 }, 4);
+          ctx.fillStyle = 'rgba(8,12,14,0.85)';
+          ctx.fill();
+          text(ctx, eta, X, ly + fs / 2 + 2, fs, C.text, 'center', 700);
+        }
       });
     }
   }
@@ -849,6 +872,99 @@ export class Game {
       text(ctx, code, X, Y + 1, Math.max(7, r * 0.95), '#0b0f12', 'center', 900);
     }
     ctx.globalAlpha = 1;
+  }
+
+  /** Arrival time at each waypoint (clock time until the first hold, then time after that code is called). */
+  private etaLabels(u: PlanUnit): string[] {
+    const st = UNITS[u.type];
+    const out: string[] = [];
+    let t = 0, prefix = '', wi = 0;
+    let px = u.spawn.x + 0.5, py = u.spawn.y + 0.5;
+    for (const n of this.pathFor(u)) {
+      const cx = n.x + 0.5, cy = n.y + 0.5;
+      t += Math.hypot(cx - px, cy - py) / (st.speed * speedMult(tileAt(this.map, Math.floor(px), Math.floor(py)), st.move));
+      px = cx; py = cy;
+      const w = u.waypoints[wi];
+      if (w && w.x === n.x && w.y === n.y) {
+        out[wi] = prefix ? `${prefix} +${Math.round(t)}s` : fmtTime(t);
+        if (w.code) { prefix = w.code; t = 0; }
+        wi++;
+      }
+    }
+    return out;
+  }
+
+  /** Objective zones on the map: dashed while pending, pulsing while live (tinted by holder), faded when closed. */
+  private drawObjectives() {
+    const ctx = this.ctx, ts = this.ts;
+    const sim = this.phase === 'plan' ? null : this.sim;
+    const pulse = 0.5 + 0.5 * Math.sin(this.now / 220);
+    for (const o of this.map.objectives) {
+      const phase = sim ? sim.objectivePhase(o) : 'pending';
+      const holder = sim && phase === 'live' ? sim.objectiveHolder(o) : null;
+      const X = this.sx(o.x), Y = this.sy(o.y), R = o.r * ts;
+      ctx.beginPath(); ctx.arc(X, Y, R, 0, Math.PI * 2);
+      if (phase === 'live') {
+        ctx.fillStyle = holder === 0 ? 'rgba(78,168,255,0.2)' : holder === 1 ? 'rgba(255,92,92,0.2)' : 'rgba(255,210,63,0.08)';
+        ctx.fill();
+        ctx.strokeStyle = holder === 'contested' ? '#ffffff' : withAlpha(C.hold, 0.55 + 0.45 * pulse);
+        ctx.lineWidth = 2.5;
+        ctx.setLineDash(holder === 'contested' ? [ts * 0.2, ts * 0.15] : []);
+      } else {
+        ctx.strokeStyle = phase === 'pending' ? 'rgba(255,210,63,0.6)' : 'rgba(255,255,255,0.18)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([ts * 0.25, ts * 0.2]);
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+      const fs = Math.max(9, ts * 0.55);
+      const label = phase === 'live'
+        ? `${o.name} · ${holder === 'contested' ? 'CONTESTED' : `${Math.ceil(o.to - sim!.elapsed)}s left`}`
+        : phase === 'pending' ? `${o.name} · ${fmtTime(o.from)}–${fmtTime(o.to)}` : `${o.name} · closed`;
+      ctx.font = `700 ${fs}px system-ui`;
+      const tw = ctx.measureText(label).width + 10;
+      // Above the ring, unless that would run into the timeline strip on the top row; then below it.
+      const above = Y - R - fs - 4;
+      const ly = above < this.sy(1.1) ? Y + R + 3 : above;
+      roundRect(ctx, { x: X - tw / 2, y: ly, w: tw, h: fs + 5 }, 4);
+      ctx.fillStyle = 'rgba(8,12,14,0.85)';
+      ctx.fill();
+      text(ctx, label, X, ly + fs / 2 + 2.5, fs, phase === 'live' ? C.hold : phase === 'pending' ? '#e9d79a' : C.dim, 'center', 700);
+    }
+  }
+
+  /** Round timeline drawn over the map's top wall row: when each objective is live, and (live) the clock. */
+  private drawTimeline() {
+    const m = this.map;
+    if (!m.objectives.length) return;
+    const ctx = this.ctx, ts = this.ts;
+    const x0 = this.sx(1), x1 = this.sx(m.w - 1), w = x1 - x0;
+    const y = this.sy(0) + ts * 0.12, h = ts * 0.76;
+    const T = RULES.roundSeconds;
+    const sim = this.phase === 'plan' ? null : this.sim;
+    roundRect(ctx, { x: x0, y, w, h }, 4);
+    ctx.fillStyle = 'rgba(8,12,14,0.9)';
+    ctx.fill();
+    const fs = Math.max(8, Math.min(12, h * 0.62));
+    for (let s = 30; s < T; s += 30) {
+      const x = x0 + (s / T) * w;
+      ctx.fillStyle = 'rgba(255,255,255,0.12)';
+      ctx.fillRect(x, y, 1, h);
+    }
+    for (const o of m.objectives) {
+      const a = x0 + (o.from / T) * w, b = x0 + (o.to / T) * w;
+      const phase = sim ? sim.objectivePhase(o) : 'pending';
+      const holder = sim && phase === 'live' ? sim.objectiveHolder(o) : null;
+      ctx.fillStyle = holder === 0 ? 'rgba(78,168,255,0.45)' : holder === 1 ? 'rgba(255,92,92,0.45)'
+        : phase === 'closed' ? 'rgba(255,255,255,0.08)' : 'rgba(255,210,63,0.28)';
+      ctx.fillRect(a + 1, y + 2, b - a - 2, h - 4);
+      fitText(ctx, `${o.name} ${fmtTime(o.from)}`, (a + b) / 2, y + h / 2 + 1, b - a - 6, fs, phase === 'closed' ? C.dim : C.text, 'center', 700, 7);
+    }
+    if (sim) {
+      const x = x0 + Math.min(1, sim.elapsed / T) * w;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(x - 1, y - 2, 2, h + 4);
+    }
   }
 
   // ======================= Drawing: planning =======================
@@ -874,6 +990,8 @@ export class Game {
     // enemy side is unknown during planning
     ctx.fillStyle = 'rgba(5,8,10,0.35)';
     ctx.fillRect(this.sx(m.w / 2), this.sy(0), (m.w / 2) * ts, m.h * ts);
+    this.drawObjectives();
+    this.drawTimeline();
 
     this.defenses.forEach((d, i) => {
       this.drawDefense({ ...d, team: PLAYER });
@@ -884,7 +1002,7 @@ export class Game {
     });
     const sel = this.selUnit();
     for (const u of this.units) if (u !== sel) this.drawPath({ x: u.spawn.x + 0.5, y: u.spawn.y + 0.5 }, this.pathFor(u), u.waypoints, C.team[PLAYER], false);
-    if (sel) this.drawPath({ x: sel.spawn.x + 0.5, y: sel.spawn.y + 0.5 }, this.pathFor(sel), sel.waypoints, '#cfe6ff', true);
+    if (sel) this.drawPath({ x: sel.spawn.x + 0.5, y: sel.spawn.y + 0.5 }, this.pathFor(sel), sel.waypoints, '#cfe6ff', true, undefined, this.etaLabels(sel));
     this.units.forEach((u, i) => {
       const dragging = this.down?.dragging && this.down.dragUnit === u.id;
       this.drawUnitGlyph(u.spawn.x + 0.5, u.spawn.y + 0.5, PLAYER, u.type, i + 1, 0, { selected: u === sel, alpha: dragging ? 0.35 : 1 });
@@ -935,6 +1053,9 @@ export class Game {
       for (let x = 0; x < m.w; x++)
         if (!this.fog[y * m.w + x] && tileAt(m, x, y) !== 'wall') ctx.fillRect(this.sx(x), this.sy(y), ts + 0.5, ts + 0.5);
 
+    this.drawObjectives();
+    this.drawTimeline();
+
     // own remaining paths
     for (const u of sim.units) {
       if (u.team !== PLAYER || u.state === 'dead' || u.pi >= u.path.length) continue;
@@ -974,6 +1095,7 @@ export class Game {
       if (u.type === 'tank' && (u.x !== u.px || u.y !== u.py)) this.hulls.set(u.id, Math.atan2(u.y - u.py, u.x - u.px));
       this.drawUnitGlyph(x, y, u.team, u.type, u.num, u.facing, {
         hpFrac: u.hp / u.maxHp, ring, suppressed: sim.isSuppressed(u), hull: this.hulls.get(u.id) ?? u.facing,
+        overwatch: u.team === PLAYER && sim.isOverwatching(u) && u.state !== 'holding',
         code: u.team === PLAYER && u.state === 'holding' ? u.holdCode : null,
       });
     }
@@ -1198,9 +1320,9 @@ export class Game {
       ctx.globalAlpha = dead ? 0.35 : 1;
       const fs = Math.max(10, Math.min(13, main.w * 0.11, main.h * 0.28));
       const label = dead ? 'KIA' : holding ? 'GO ▶' : u.state === 'moving' ? (u.engaged ? 'Engaging' : 'Moving')
-        : u.state === 'done' ? (u.engaged ? 'Engaging' : 'In position') : u.state === 'recalling' ? 'Falling back' : 'Home';
+        : u.state === 'done' ? (u.engaged ? 'Engaging' : sim.isOverwatching(u) ? 'Overwatch' : 'In position') : u.state === 'recalling' ? 'Falling back' : 'Home';
       const lx = main.x + g + 14;
-      fitText(ctx, label, lx, main.y + main.h * 0.36, main.x + main.w - lx - 6, holding ? fs * 1.1 : fs, holding ? holdCol : u.engaged ? C.danger : C.text, 'left', 800);
+      fitText(ctx, label, lx, main.y + main.h * 0.36, main.x + main.w - lx - 6, holding ? fs * 1.1 : fs, holding ? holdCol : u.engaged ? C.danger : C.text, 'left', 800, 7);
       bar(ctx, { x: lx, y: main.y + main.h * 0.66, w: main.x + main.w - lx - 8, h: 5 }, u.hp / u.maxHp, u.hp / u.maxHp > 0.35 ? C.ok : C.danger);
       ctx.globalAlpha = 1;
       if (holding && live) this.hits.push({ ...main, fn: () => this.command(u, 'go') });
@@ -1270,8 +1392,18 @@ export class Game {
     } else if (this.sim) {
       text(ctx, fmtTime(this.sim.timeLeft), this.W - 12, h / 2, fs * 1.1, this.sim.timeLeft < 15 ? C.danger : C.text, 'right', 800);
       text(ctx, 'LIVE', 12 + fs * 6, h / 2, fs, C.danger, 'left', 800);
-      const alive = [this.sim.alive(0).length, this.sim.alive(1).length];
-      text(ctx, `${alive[0]} alive`, this.W - 80, h / 2, fs * 0.85, C.dim, 'right', 700);
+      if (this.map.objectives.length) {
+        const [p0, p1] = this.sim.score.map((v) => Math.round(v));
+        const rx = this.W - 76;
+        text(ctx, String(p1), rx, h / 2, fs * 1.05, C.team[1], 'right', 800);
+        ctx.font = `800 ${fs * 1.05}px system-ui`;
+        const w1 = ctx.measureText(String(p1)).width;
+        text(ctx, '·', rx - w1 - 8, h / 2, fs, C.dim, 'center', 800);
+        text(ctx, String(p0), rx - w1 - 16, h / 2, fs * 1.05, C.team[0], 'right', 800);
+        ctx.font = `800 ${fs * 1.05}px system-ui`;
+        const w0 = ctx.measureText(String(p0)).width;
+        text(ctx, 'PTS', rx - w1 - 22 - w0, h / 2, fs * 0.75, C.dim, 'right', 700);
+      }
     }
   }
 
@@ -1282,7 +1414,8 @@ export class Game {
     ctx.font = '700 14px system-ui';
     const areaW = this.side ? this.panel.x : this.W;
     const w = Math.min(areaW - 24, ctx.measureText(t.msg).width + 28);
-    const r: Rect = { x: (areaW - w) / 2, y: this.top + 10, w, h: 32 };
+    // Bottom of the map area: the top of the map carries the objective timeline.
+    const r: Rect = { x: (areaW - w) / 2, y: this.oy + this.map.h * this.ts - this.ts * 1.1 - 32, w, h: 32 };
     ctx.globalAlpha = Math.min(1, (t.until - this.now) / 300);
     roundRect(ctx, r, 16);
     ctx.fillStyle = 'rgba(10,14,17,0.92)';
@@ -1320,6 +1453,7 @@ export class Game {
     this.overlay([
       { s: head, size: big, color: col, weight: 900 },
       { s: r.reason, size: 18, color: C.text },
+      ...(this.map.objectives.length && !r.reason.includes('objectives') ? [{ s: `Objective points  ${r.score[0]} – ${r.score[1]}`, size: 15, color: C.hold }] : []),
       { s: `Kills  ${r.kills[0]} – ${r.kills[1]}     Survivors carried over: ${r.survivors[0].length}`, size: 15, color: C.dim },
       { s: `+$${s.earned[0]} income`, size: 18, color: C.ok },
     ], this.match.winner !== undefined ? 'Tap to see the result' : 'Tap to plan the next round');
@@ -1338,12 +1472,12 @@ export class Game {
   private drawTitle() {
     const ctx = this.ctx;
     const rules = [
-      ['1', 'Each round: buy units and defenses, route every unit. Take your time.'],
-      ['2', 'Tap a waypoint to tag it ALPHA, BRAVO or CHARLIE. Units hold there.'],
-      ['3', 'Live: call a go code to release everyone holding on it, together.'],
-      ['4', 'Tanks crush infantry. Rocketeers kill tanks. Rifles kill rocketeers.'],
-      ['5', 'Hold buildings: windows to shoot from, walls that stop bullets.'],
-      ['6', 'Win by wiping them out or hitting an unguarded base. First to 5.'],
+      ['1', 'Objectives go live on a schedule. Hold one uncontested to score.'],
+      ['2', 'Buy and route every unit — waypoints show arrival times. No timer.'],
+      ['3', 'Tag waypoints ALPHA/BRAVO/CHARLIE; call the code to move together.'],
+      ['4', 'Moving units are exposed. Still, quiet units ambush with aimed fire.'],
+      ['5', 'Tanks beat infantry, rockets beat tanks, rifles beat rockets.'],
+      ['6', 'Most points at time wins — or wipe them out. First to 5 rounds.'],
     ];
     const fs = Math.max(11, Math.min(16, this.W * 0.021, this.H * 0.034));
     const big = Math.min(64, this.W * 0.1, this.H * 0.11);

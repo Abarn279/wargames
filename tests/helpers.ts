@@ -13,6 +13,7 @@ export function field(w = 30, h = 9, paint?: (set: (x: number, y: number, t: Til
     deploy: [{ x0: 1, x1: 5 }, { x0: w - 6, x1: w - 2 }],
     fortify: [{ x0: 1, x1: 10 }, { x0: w - 11, x1: w - 2 }],
     ai: { lanes: [], guard: [], garrison: [], turret: [], barricade: [], tanktrap: [], mine: [] },
+    objectives: [],
   };
 }
 

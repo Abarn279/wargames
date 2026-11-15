@@ -14,7 +14,7 @@ function runRound(m: GameMap, match: Match, seed: number) {
   match.teams[0].money -= p0.spent;
   match.teams[1].money -= p1.spent;
   const sim = new Sim(m, [p0.plan, p1.plan], seed);
-  const ai = [new AiDirector(0, seed + 11), new AiDirector(1, seed + 12)];
+  const ai = [new AiDirector(0, seed + 11, p0.schedule), new AiDirector(1, seed + 12, p1.schedule)];
   while (!sim.result) sim.step([...ai[0].think(sim), ...ai[1].think(sim)]);
   return sim;
 }
@@ -154,7 +154,7 @@ describe('sim', () => {
     sim.step(cmds);
     while (!sim.result) sim.step();
     expect(sim.result.winner).toBeNull();
-    expect(sim.result.reason).toBe('Everyone pulled back');
+    expect(sim.result.reason).toContain('tied');
   });
 
   it('a lone breacher can destroy an undefended base', () => {

@@ -7,6 +7,18 @@ export type Tile =
 
 export interface Pt { x: number; y: number }
 
+/**
+ * A point that scores while it is live: each second one team holds it uncontested is a point.
+ * Windows are published before the round, so plans become timelines: where to be, and when.
+ */
+export interface Objective {
+  id: string;
+  name: string;
+  x: number; y: number; // center, tile coordinates
+  r: number; // radius in tiles
+  from: number; to: number; // live window, seconds into the round
+}
+
 export interface AiLane { pts: Pt[]; hold: number; vehicle: boolean }
 /** Positions the AI uses, authored from the west side and mirrored for the east. */
 export interface AiSpots {
@@ -33,6 +45,7 @@ export interface GameMap {
   /** Inclusive x-range where each team may place defenses. */
   fortify: [{ x0: number; x1: number }, { x0: number; x1: number }];
   ai: AiSpots;
+  objectives: Objective[];
 }
 
 const CH: Record<string, Tile> = {
@@ -56,7 +69,7 @@ function build(def: Omit<GameMap, 'w' | 'h' | 'tiles' | 'bases' | 'deploy' | 'fo
     }
   }
   return {
-    id: def.id, name: def.name, blurb: def.blurb, ai: def.ai,
+    id: def.id, name: def.name, blurb: def.blurb, ai: def.ai, objectives: def.objectives,
     w, h, tiles,
     bases: [{ x: 1.5, y: def.baseY }, { x: w - 1.5, y: h - def.baseY }],
     deploy: [{ x0: 1, x1: def.deployW }, { x0: w - 1 - def.deployW, x1: w - 2 }],
@@ -69,6 +82,12 @@ const RIVERSIDE = build({
   id: 'riverside',
   name: 'Riverside',
   blurb: 'Two bridges for armor, a ford for infantry, buildings overlooking both.',
+  // The bridges mirror each other (each side has a building overlooking one); the ford is dead center.
+  objectives: [
+    { id: 'nbridge', name: 'North bridge', x: 20, y: 3.5, r: 2.2, from: 15, to: 45 },
+    { id: 'sbridge', name: 'South bridge', x: 20, y: 18.5, r: 2.2, from: 45, to: 75 },
+    { id: 'ford', name: 'Ford', x: 20, y: 11, r: 2.6, from: 75, to: 115 },
+  ],
   baseY: 11,
   deployW: 6,
   fortifyW: 17,
@@ -115,6 +134,11 @@ const CROSSROADS = build({
   id: 'crossroads',
   name: 'Crossroads',
   blurb: 'Compact, open, three lanes. Fast and bloody.',
+  objectives: [
+    { id: 'north', name: 'North lane', x: 18, y: 2.5, r: 2.2, from: 15, to: 45 },
+    { id: 'south', name: 'South lane', x: 18, y: 17.5, r: 2.2, from: 45, to: 75 },
+    { id: 'center', name: 'Center', x: 18, y: 10, r: 2.4, from: 75, to: 115 },
+  ],
   baseY: 10,
   deployW: 6,
   fortifyW: 15,

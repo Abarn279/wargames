@@ -163,6 +163,18 @@ export const RULES = {
   baseDefendRadius: 4.5,
   coverReduction: 0.4,
   suppressedAccuracy: 0.7,
+  /** Units that moved within this window lose cover/garrison protection and shoot worse. */
+  exposedSeconds: 0.6,
+  exposedAccuracy: 0.75,
+  /** Overwatch: still for this long and quiet for this long -> next shot is an aimed ambush shot. */
+  overwatchSettleSeconds: 1,
+  overwatchQuietSeconds: 3,
+  overwatchAccuracy: 1.4,
+  overwatchDamage: 1.5,
+  /** How long the ambush bonus lasts once a unit on overwatch opens fire. */
+  ambushBurstSeconds: 1.5,
+  /** Target-score multiplier for enemies that just shot at a teammate (covering fire). */
+  coverFirePriority: 2.5,
   suppressedSpeed: 0.5,
   mineBlastRadius: 1.6,
   /** Units in forest or buildings are only spotted this close, unless they fire. */
